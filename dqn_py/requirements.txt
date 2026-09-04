@@ -1,0 +1,5 @@
+torch
+gama-client
+numpy<2
+pandas
+matplotlib

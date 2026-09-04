@@ -1,0 +1,51 @@
+# Environments and dependencies
+dqn_py/venv/
+venv/
+env/
+.venv/
+.env
+
+# Python bytecode & cache
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+
+# GAMA & Eclipse workspace artifacts
+.metadata/
+.workspace*/
+.cache/
+.built_in_models_*
+.gama_application_workspace
+tmp_ws/
+**/server_ws/
+
+# Logs and runtime outputs
+*.log
+dqn_py/setup.log
+dqn_py/smoke_test.log
+dqn_py/run/*.log
+comparison_results/*.log
+
+# Ephemeral training runs (keeping only final benchmarked run: train_20260829_153936)
+dqn_py/run/train_20260829_084949/
+dqn_py/run/train_20260829_152802/
+dqn_py/run/train_20260829_152940/
+
+# LaTeX build intermediate files
+*.aux
+*.out
+*.toc
+*.fls
+*.fdb_latexmk
+*.synctex.gz
+
+# macOS system files
+.DS_Store
+.DS_Store?
+._*
+.Spotlight-V100
+.Trashes
+
+# Large research papers repository (~1.9GB)
+Traffic_Papers/
