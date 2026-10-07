@@ -11,7 +11,7 @@ Kiem tra lan luot cac gia dinh cua protocol (chay sau khi gama-server san sang):
   T5. expression SET bien (dqn_action <- 1) -> doc lai dung gia tri
   T6. step(sync=True) chay dung so cycle (100 cycles -> dung tick 10s)
   T7. Handshake day du: tai tick -> set action SWITCH -> step(1)
-      -> global_phase doi sang YELLOW, next_decision_in_cycles = 130
+      -> global_phase doi sang THROUGH-YELLOW, next_decision_in_cycles = 280
   T8. reload(seed=...) reset simulation ve cycle 0
   T9. ask command goi action set_dqn_action (duong lut khi SET bi loi)
 
@@ -26,7 +26,8 @@ import json
 
 from gama_client.sync_client import GamaSyncClient
 
-from gama_env import STATE_PACK_EXPR, STATE_FIELDS, GamaEnvError
+from gama_env import DEFAULT_MODEL, STATE_PACK_EXPR, STATE_FIELDS, GamaEnvError
+from server_manager import GAMA_HEADLESS
 
 RESULTS = []
 
@@ -53,10 +54,10 @@ async def main():
         check("T1-connect", True, f"ws://{args.host}:{args.port}")
     except Exception as e:
         check("T1-connect", False, f"{e} - gama-server da chay chua? "
-                                   f"(bash /Applications/Gama.app/Contents/headless/gama-headless.sh -socket {args.port})")
-        return
+                                   f"(bash {GAMA_HEADLESS} -socket {args.port})")
+        return 1
 
-    model_path = "/Users/mac/Documents/GAMA/Traffic/models/intersection-dqn-python.gaml"
+    model_path = DEFAULT_MODEL
 
     # T2: Describe
     try:
@@ -78,7 +79,8 @@ async def main():
         check("T3-load", ok, f"exp_id={exp_id}" if ok else f"resp={json.dumps(resp)[:300]}")
     except Exception as e:
         check("T3-load", False, str(e)[:200])
-        return
+        client.close_connection()
+        return 1
 
     async def expr(e):
         r = await client.expression_awaitable(exp_id, e, timeout=600.0)
@@ -137,10 +139,10 @@ async def main():
             phase_after = int(float(await expr("global_phase")))
             waiting_after = str(await expr("dqn_waiting_action")).lower() == "true"
             nb = int(float(await expr("next_decision_in_cycles")))
-            ok = (phase_after == 1) and (not waiting_after) and (nb == 130)
+            ok = (phase_after == 1) and (not waiting_after) and (nb == 280)
             check("T7b-handshake", ok,
                   f"phase={phase_after} (1=NS-YELLOW dung), next_decision={nb} "
-                  f"(30 vang + 100 min green = 130 dung)"
+                  f"(30 vang + 120 re trai + 30 vang + 100 min green = 280)"
                   if ok else f"phase={phase_after}, waiting={waiting_after}, nb={nb}")
     except Exception as e:
         check("T7b-handshake", False, str(e)[:200])
@@ -148,7 +150,7 @@ async def main():
     # T8: reload + seed
     try:
         resp = await client.reload_awaitable(
-            exp_id, parameters=[{"type": "float", "value": "123.0", "name": "seed"}],
+            exp_id, parameters=[{"type": "float", "value": "123.0", "name": "rng_seed"}],
             timeout=600.0)
         cycle0 = int(float(await expr("cycle")))
         ok = resp.get("type") == "CommandExecutedSuccessfully" and cycle0 == 0
@@ -180,6 +182,7 @@ async def main():
     else:
         print("⚠️  Co test FAIL - kiem tra lai protocol/model truoc khi train.")
     client.close_connection()
+    return 0 if n_pass == len(RESULTS) else 1
 
 async def _silent_handler(message):
     """An cac message server (console/status) de test sach se."""
@@ -187,4 +190,4 @@ async def _silent_handler(message):
 
 
 if __name__ == "__main__":
-    asyncio.run(main())
+    raise SystemExit(asyncio.run(main()))

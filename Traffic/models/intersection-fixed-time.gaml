@@ -1,164 +1,104 @@
 /**
 * Name: intersection_traffic
 * Description: 4-way traffic intersection simulation with Fixed-Time baseline signal controller.
+*              Enhanced with realistic mixed-traffic vehicles (cars, motorcycles, buses)
+*              and rich urban road infrastructure visuals.
 */
 
-model intersection_traffic
-
+model intersection_trafficn
 import "../includes/collision_avoidance.gaml"
 
 global {
-	// GLOBAL TRAFFIC LIGHT CONTROLLER (4-Phase Cycle with Yellow Lights)
-	// Phase 0: North-South GREEN (30s), East-West RED
-	// Phase 1: North-South YELLOW (3s), East-West RED
-	// Phase 2: East-West GREEN (30s), North-South RED
-	// Phase 3: East-West YELLOW (3s), North-South RED
+	// Each axis: through green/yellow, then protected left green/yellow.
 	float global_counter <- 0.0;
-	list<float> phase_durations <- [30#s, 3#s, 30#s, 3#s];
-	
+	list<float> phase_durations <- [30#s, 3#s, 12#s, 3#s,
+		30#s, 3#s, 12#s, 3#s];
+
 	reflex traffic_light_controller {
-		global_counter <- global_counter + step;
+		signal_phase_schedule <- phase_durations;
+		global_counter <- (round(global_counter / step) + 1) * step;
+		phase_timer <- global_counter;
 		if (global_counter >= phase_durations[global_phase]) {
-			global_counter <- 0.0;
-			global_phase <- (global_phase + 1) mod length(phase_durations);
-		}
-	}
-	
-	reflex spawn_traffic_ns when: every(spawn_rate_NS #cycle) {
-		loop start_inter over: [intersection(5), intersection(7)] {
-			if (empty(base_vehicle_species at_distance 7.0 #m where (distance_to(each.location, start_inter.location) < 7.0 #m))) {
-				create base_vehicle_species number: 1 {
-					total_vehicles_created <- total_vehicles_created + 1;
-					bool is_car <- flip(0.4);
-					if (is_car) {
-						vehicle_length <- 4.5 #m;
-						num_lanes_occupied <- 2;
-						max_speed <- (25 + rnd(15)) #km / #h;
-					} else {
-						vehicle_length <- 2.5 #m;
-						num_lanes_occupied <- 1;
-						max_speed <- (20 + rnd(15)) #km / #h;
-					}
-					
-					location <- start_inter.location;
-					intersection target_straight; intersection target_left; intersection target_right;
-					
-					if (start_inter = intersection(5)) {
-						target_straight <- intersection(7); target_right <- intersection(6); target_left <- intersection(4);
-					} else if (start_inter = intersection(7)) {
-						target_straight <- intersection(5); target_right <- intersection(4); target_left <- intersection(6);
-					}
-					
-					intersection chosen_target <- rnd_choice([target_straight :: 0.5, target_left :: 0.25, target_right :: 0.25]);
-					target <- chosen_target;
-					do compute_path graph: road_network target: target;
-					
-					if (chosen_target = target_left) { 
-						current_lane <- is_car ? 4 : rnd(4, 5); 
-						color <- #cyan; 
-					} else if (chosen_target = target_right) { 
-						current_lane <- is_car ? 0 : rnd(0, 1); 
-						color <- #magenta; 
-					} else { 
-						current_lane <- is_car ? 2 : rnd(2, 3); 
-						color <- #lime; 
-					}
-				}
+			// The nominal yellow has ended. Keep every approach red until
+			// vehicles admitted by the old phase have left the junction.
+			if (global_phase mod 2 = 0 or junction_clear()) {
+				global_counter <- 0.0;
+				phase_timer <- 0.0;
+				global_phase <- (global_phase + 1) mod length(phase_durations);
+			} else {
+				global_counter <- phase_durations[global_phase];
+				phase_timer <- global_counter;
 			}
 		}
+		float remaining <- max([0.0, phase_durations[global_phase] - global_counter]);
+		signal_display_seconds <- int(remaining / (1 #s) + 0.999);
+		signal_countdown <- "" + int(remaining / (1 #s) + 0.999) + "s";
 	}
 
-	reflex spawn_traffic_ew when: every(spawn_rate_EW #cycle) {
-		loop start_inter over: [intersection(4), intersection(6)] {
-			if (empty(base_vehicle_species at_distance 7.0 #m where (distance_to(each.location, start_inter.location) < 7.0 #m))) {
-				create base_vehicle_species number: 1 {
-					total_vehicles_created <- total_vehicles_created + 1;
-					bool is_car <- flip(0.4);
-					if (is_car) {
-						vehicle_length <- 4.5 #m;
-						num_lanes_occupied <- 2;
-						max_speed <- (25 + rnd(15)) #km / #h;
-					} else {
-						vehicle_length <- 2.5 #m;
-						num_lanes_occupied <- 1;
-						max_speed <- (20 + rnd(15)) #km / #h;
-					}
-					
-					location <- start_inter.location;
-					intersection target_straight; intersection target_left; intersection target_right;
-					
-					if (start_inter = intersection(4)) {
-						target_straight <- intersection(6); target_right <- intersection(5); target_left <- intersection(7);
-					} else if (start_inter = intersection(6)) {
-						target_straight <- intersection(4); target_right <- intersection(7); target_left <- intersection(5);
-					}
-					
-					intersection chosen_target <- rnd_choice([target_straight :: 0.5, target_left :: 0.25, target_right :: 0.25]);
-					target <- chosen_target;
-					do compute_path graph: road_network target: target;
-					
-					if (chosen_target = target_left) { 
-						current_lane <- is_car ? 4 : rnd(4, 5); 
-						color <- #cyan; 
-					} else if (chosen_target = target_right) { 
-						current_lane <- is_car ? 0 : rnd(0, 1); 
-						color <- #magenta; 
-					} else { 
-						current_lane <- is_car ? 2 : rnd(2, 3); 
-						color <- #lime; 
-					}
-				}
-			}
-		}
-	}
-	
-	reflex update_metrics {
-		int queue <- 0;
-		float sum_wait <- 0.0;
-		float sum_speed <- 0.0;
-		int count <- length(base_vehicle_species);
-		
-		if (count > 0) {
-			loop v over: base_vehicle_species {
-				if (v.speed < 1.0 #km/#h) {
-					queue <- queue + 1;
-				}
-				sum_wait <- sum_wait + v.waiting_time;
-				sum_speed <- sum_speed + v.speed;
-			}
-			average_waiting_time <- sum_wait / count;
-			max_waiting_time <- max(base_vehicle_species collect each.waiting_time);
-			average_speed <- (sum_speed / count) * 3.6;
-			current_queue_length <- queue;
-		} else {
-			average_waiting_time <- 0.0;
-			max_waiting_time <- 0.0;
-			average_speed <- 0.0;
-			current_queue_length <- 0;
-		}
-		
-		if (cycle mod 10 = 0 and cycle > 0) {
-			write "METRIC_CSV," + cycle + "," + total_vehicles_passed + "," + (round(average_waiting_time*100.0)/100.0) + "," + current_queue_length + "," + (round(average_speed*100.0)/100.0) + "," + (round(average_travel_time*100.0)/100.0) + "," + (round(max_waiting_time*100.0)/100.0);
-		}
-		
-		if (cycle mod 50 = 0 and cycle > 0) {
-			write ">> Cycle: " + cycle + " | Phase: " + phase_names[global_phase] + " (" + round(global_counter*10.0)/10.0 + "s/" + phase_durations[global_phase] + "s) | Passed: " + total_vehicles_passed + " | Queue: " + current_queue_length + " | Avg Wait: " + (round(average_waiting_time*10.0)/10.0) + "s | Max Wait: " + (round(max_waiting_time*10.0)/10.0) + "s | Avg Speed: " + (round(average_speed*10.0)/10.0) + " km/h | Avg Travel: " + (round(average_travel_time*10.0)/10.0) + "s";
-		}
+	// A1+A4: Spawn and metrics are now centralized in collision_avoidance.gaml
+	// Only verbose logging remains here (specific to Fixed-Time)
+	reflex verbose_log when: (cycle mod 50 = 0 and cycle > 0) {
+		int rem_time <- int(phase_durations[global_phase] - global_counter);
+		write ">> Cycle: " + cycle + " | Phase: " + phase_names[global_phase] + " (Còn " + rem_time + "s / " + int(phase_durations[global_phase]) + "s) | Passed: " + total_vehicles_passed + " | Queue: " + current_queue_length + " | TIT: " + (round(total_tit_sum*10.0)/10.0) + "s | Severe TTC: " + severe_conflicts_count + " | PET: " + (round(min_pet_observed*10.0)/10.0) + "s";
 	}
 }
 
 experiment my_experiment type: gui {
-	float minimum_cycle_duration <- 0.05#s;
+	parameter "Xe cầu vượt và hầm" var: enable_bypass_traffic;
+	parameter "Xem mặt cắt hầm" var: show_tunnel_cutaway;
+	float minimum_cycle_duration <- 0.05#s; // Up to 2 model seconds per wall second (step = 0.1 s)
 	output {
-		display intersection_view background: #black {
+		monitor "Xe hoàn thành mặt đất" value: total_vehicles_passed;
+		monitor "Xe hoàn thành cầu vượt/hầm" value: bypass_vehicles_passed;
+		monitor "Hàng đợi mặt đất" value: current_queue_length;
+		monitor "Pha đèn" value: phase_names[global_phase];
+		monitor "Đếm ngược pha" value: signal_countdown;
+		monitor "Chờ trung bình (s)" value: average_waiting_time;
+		display doan_3d type: opengl background: rgb(8,12,22) {
+			camera 'default' location: {820,1210,220} target: {1000,1000,16};
+			species doan_ground aspect: base;
+			species bridge_pillar;
+			species metro_pillar;
+			species tunnel_structure;
+			species flyover_structure;
+			species metro_structure;
+			species traffic_signal_post aspect: doan_3d;
+			species base_vehicle_species aspect: doan_3d;
+			species doan_metro aspect: base;
+		}
+
+		display intersection_view background: rgb(18, 22, 28) {
+			// 1. Mat duong Asphalt & Via he
+			species doan_ground aspect: base;
 			species road aspect: base;
+			// 2. Vach ke duong, vach di bo zebra, mui ten chi lan, yellow box
+			// 3. Cot den tin hieu 3 mau phat sang
+			species traffic_signal_post aspect: base;
+			// 4. O xung dot tam ngat tu do PET
+			species conflict_zone aspect: base;
+			// 5. Phuong tien giao thong chi tiet (Xe may, O to, Bus)
 			species base_vehicle_species aspect: base;
-			species intersection aspect: base;
+
+			// 6. BANG DIEU KHIEN HUD DARK GLASSMORPHISM
 			graphics "HUD" {
-				draw "FIXED-TIME BASELINE" at: {20, 15} color: #yellow font: font("Helvetica", 14, #bold);
-				draw "Phase: " + phase_names[global_phase] + " (" + int(global_counter) + "s / " + int(phase_durations[global_phase]) + "s)" at: {20, 35} color: (global_phase = 0 or global_phase = 2 ? #lime : (global_phase = 1 or global_phase = 3 ? #yellow : #red)) font: font("Helvetica", 16, #bold);
-				draw "Passed: " + total_vehicles_passed + " | Active: " + length(base_vehicle_species) + " | Queue: " + current_queue_length at: {20, 60} color: #white font: font("Helvetica", 13, #plain);
-				draw "Avg Wait: " + (round(average_waiting_time*10.0)/10.0) + "s | Avg Speed: " + (round(average_speed*10.0)/10.0) + " km/h" at: {20, 80} color: #cyan font: font("Helvetica", 13, #plain);
+				int rem_time <- int(phase_durations[global_phase] - global_counter);
+				rgb phase_c <- global_phase mod 2 = 0 ? #lime : #yellow;
+
+				// Khung HUD ban mo
+				draw rectangle(310, 105) at: {165, 58} color: rgb(15, 23, 42, 215) border: rgb(71, 85, 105);
+
+				// Tieu de
+				draw "TRAFFIC-LIGHT ABM | FIXED-TIME" at: {20, 22} color: rgb(241, 196, 15) font: font("Helvetica", 13, #bold);
+
+				// Pha den & Dem lui
+				draw circle(4.5) at: {26, 42} color: phase_c;
+				draw "Phase: " + phase_names[global_phase] + " (Còn " + rem_time + "s / " + int(phase_durations[global_phase]) + "s)" at: {38, 45} color: phase_c font: font("Helvetica", 14, #bold);
+
+				// Chi so luu thong
+				draw "Passed: " + total_vehicles_passed + " xe | Queue: " + current_queue_length + " | Avg Wait: " + (round(average_waiting_time*10.0)/10.0) + "s" at: {20, 68} color: rgb(226, 232, 240) font: font("Helvetica", 12, #plain);
+
+				// Chi so an toan
+				draw "TIT: " + (round(total_tit_sum*10.0)/10.0) + "s | TTC<1s: " + severe_conflicts_count + " | HardBrakes: " + hard_braking_count + " | PET: " + (round(min_pet_observed*10.0)/10.0) + "s" at: {20, 90} color: rgb(248, 113, 113) font: font("Helvetica", 11, #plain);
 			}
 		}
 		display performance_charts {
@@ -171,8 +111,6 @@ experiment my_experiment type: gui {
 	}
 }
 
-experiment my_batch_experiment type: batch until: (cycle >= 2000) {
-	// Seed giam de 4 thuat toan (Fixed-Time/MaxPressure/Q-Learning/DQN) chay
-	// cung luong yeu cau xe -> so sanh cong bang & kha lap lai
+experiment my_batch_experiment type: batch until: (cycle >= doan_horizon_cycles) {
 	parameter "Seed" var: seed init: 5001.0;
 }

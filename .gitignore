@@ -19,18 +19,16 @@ __pycache__/
 .gama_application_workspace
 tmp_ws/
 **/server_ws/
+test_vehicle_behavior_batch/
 
 # Logs and runtime outputs
 *.log
-dqn_py/setup.log
-dqn_py/smoke_test.log
-dqn_py/run/*.log
-comparison_results/*.log
-
-# Ephemeral training runs (keeping only final benchmarked run: train_20260829_153936)
-dqn_py/run/train_20260829_084949/
-dqn_py/run/train_20260829_152802/
-dqn_py/run/train_20260829_152940/
+comparison_results/
+diagnostics/
+dqn_py/run/
+.Rhistory
+*.bak
+Traffic/models/tmp_*.gaml
 
 # LaTeX build intermediate files
 *.aux
@@ -39,6 +37,19 @@ dqn_py/run/train_20260829_152940/
 *.fls
 *.fdb_latexmk
 *.synctex.gz
+*.nav
+*.snm
+seminar/preview/
+seminar/original/
+seminar/previous_version/
+seminar/speaker_notes.tex
+seminar/figures/*.png
+seminar/figures/data_summary.json
+seminar/figures/test_queue.pdf
+seminar/figures/test_seeds.pdf
+seminar/quality_check.json
+seminar/slide_manifest.json
+seminar/*_generated.*
 
 # macOS system files
 .DS_Store

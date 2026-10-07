@@ -1,0 +1,29 @@
+﻿time_slot,station_id,station_name,direction,heading,motorbike,car,small_truck_bus,heavy_truck_bus,trailer,total_flow
+06h00-07h00 (Sang),1,Nguyen Trai di Ha Dong,East_to_West,270.0,6100,1960,310,280,0,8650
+06h00-07h00 (Sang),2,Nguyen Trai di Nga Tu So,West_to_East,90.0,8700,2500,360,350,0,11910
+06h00-07h00 (Sang),3,Khuat Duy Tien di Linh Dam,North_to_South,180.0,7800,2100,330,270,0,10500
+06h00-07h00 (Sang),4,Nguyen Xien di Trung Hoa,South_to_North,0.0,8100,2328,280,280,0,10988
+07h00-08h00 (Cao diem sang),1,Nguyen Trai di Ha Dong,East_to_West,270.0,10100,2600,295,290,0,13285
+07h00-08h00 (Cao diem sang),2,Nguyen Trai di Nga Tu So,West_to_East,90.0,14400,3000,370,330,0,18100
+07h00-08h00 (Cao diem sang),3,Khuat Duy Tien di Linh Dam,North_to_South,180.0,10800,2600,340,310,0,14050
+07h00-08h00 (Cao diem sang),4,Nguyen Xien di Trung Hoa,South_to_North,0.0,10200,2952,162,290,0,13604
+08h00-09h00 (Sang),1,Nguyen Trai di Ha Dong,East_to_West,270.0,8500,1900,320,300,0,11020
+08h00-09h00 (Sang),2,Nguyen Trai di Nga Tu So,West_to_East,90.0,12000,2300,340,320,0,14960
+08h00-09h00 (Sang),3,Khuat Duy Tien di Linh Dam,North_to_South,180.0,9300,2700,320,290,0,12610
+08h00-09h00 (Sang),4,Nguyen Xien di Trung Hoa,South_to_North,0.0,9600,3015,165,330,0,13110
+16h00-17h00 (Chieu),1,Nguyen Trai di Ha Dong,East_to_West,270.0,5880,3260,557,145,0,9842
+16h00-17h00 (Chieu),2,Nguyen Trai di Nga Tu So,West_to_East,90.0,5300,2280,200,90,0,7870
+16h00-17h00 (Chieu),3,Khuat Duy Tien di Linh Dam,North_to_South,180.0,6700,2210,340,180,0,9430
+16h00-17h00 (Chieu),4,Nguyen Xien di Trung Hoa,South_to_North,0.0,6400,2450,315,158,0,9323
+17h00-18h00 (Cao diem chieu),1,Nguyen Trai di Ha Dong,East_to_West,270.0,8800,2550,172,99,0,11621
+17h00-18h00 (Cao diem chieu),2,Nguyen Trai di Nga Tu So,West_to_East,90.0,6700,1790,230,120,0,8840
+17h00-18h00 (Cao diem chieu),3,Khuat Duy Tien di Linh Dam,North_to_South,180.0,12950,2800,480,272,0,16502
+17h00-18h00 (Cao diem chieu),4,Nguyen Xien di Trung Hoa,South_to_North,0.0,12800,3100,520,240,0,16660
+18h00-19h00 (Chieu),1,Nguyen Trai di Ha Dong,East_to_West,270.0,5280,2330,145,95,0,7850
+18h00-19h00 (Chieu),2,Nguyen Trai di Nga Tu So,West_to_East,90.0,4020,1800,240,130,0,6190
+18h00-19h00 (Chieu),3,Khuat Duy Tien di Linh Dam,North_to_South,180.0,7800,2820,502,234,0,11356
+18h00-19h00 (Chieu),4,Nguyen Xien di Trung Hoa,South_to_North,0.0,7600,3125,558,258,0,11541
+19h00-19h30 (Toi),1,Nguyen Trai di Ha Dong,East_to_West,270.0,3500,1640,116,58,0,5314
+19h00-19h30 (Toi),2,Nguyen Trai di Nga Tu So,West_to_East,90.0,2660,1400,260,120,0,4440
+19h00-19h30 (Toi),3,Khuat Duy Tien di Linh Dam,North_to_South,180.0,5200,2800,288,184,0,8472
+19h00-19h30 (Toi),4,Nguyen Xien di Trung Hoa,South_to_North,0.0,4520,2500,330,176,0,7526

@@ -12,13 +12,17 @@ Thực thi kiểm thử tự động toàn bộ Unit Tests và Edge Cases cho:
 """
 
 import os
-import sys
 import subprocess
 import re
 import time
+import tempfile
+from collections import deque
+from pathlib import Path
 
-GAMA_HEADLESS = "/Applications/Gama.app/Contents/headless/gama-headless.sh"
-BASE_DIR = "/Users/mac/Documents/GAMA"
+GAMA_HEADLESS = os.environ.get(
+    "GAMA_HEADLESS", "/Applications/Gama.app/Contents/headless/gama-headless.sh"
+)
+BASE_DIR = str(Path(__file__).resolve().parents[1])
 TEST_MODEL = os.path.join(BASE_DIR, "Traffic/models/test_traffic_controllers.gaml")
 
 def run_test_suite():
@@ -33,36 +37,41 @@ def run_test_suite():
     ]
     
     start_time = time.time()
-    process = subprocess.Popen(
-        cmd, stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
-        text=True, bufsize=1
-    )
-    
     test_results = []
+    recent_output = deque(maxlen=25)
     pattern = re.compile(r"TEST_RESULT,([^,]+),([^,]+),([^,]+),(.*)")
     
     print("\n🚀 Đang thực thi mô phỏng và thu thập các assertions...\n")
-    
-    for line in iter(process.stdout.readline, ''):
-        line = line.strip()
-        match = pattern.search(line)
-        if match:
-            suite = match.group(1).strip()
-            test_id = match.group(2).strip()
-            status = match.group(3).strip()
-            message = match.group(4).strip()
-            
-            icon = "✅" if status == "PASS" else "❌"
-            print(f"  {icon} [{status}] {suite:12s} | {test_id:30s} | {message}")
-            
-            test_results.append({
-                "suite": suite,
-                "test_id": test_id,
-                "status": status,
-                "message": message
-            })
-            
-    process.wait()
+    with tempfile.TemporaryDirectory(prefix="gama_controller_suite_") as work:
+        with subprocess.Popen(
+            cmd, cwd=work, stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
+            text=True, bufsize=1
+        ) as process:
+            for line in process.stdout:
+                recent_output.append(line.rstrip())
+                line = line.strip()
+                match = pattern.search(line)
+                if match:
+                    suite = match.group(1).strip()
+                    test_id = match.group(2).strip()
+                    status = match.group(3).strip()
+                    message = match.group(4).strip()
+
+                    icon = "✅" if status == "PASS" else "❌"
+                    print(f"  {icon} [{status}] {suite:12s} | {test_id:30s} | {message}")
+
+                    test_results.append({
+                        "suite": suite,
+                        "test_id": test_id,
+                        "status": status,
+                        "message": message
+                    })
+        if process.returncode != 0:
+            details = "\n".join(recent_output)
+            raise RuntimeError(
+                f"GAMA test process exited with code {process.returncode}. "
+                f"Recent output:\n{details}"
+            )
     duration = time.time() - start_time
     
     # Summary report
@@ -90,6 +99,7 @@ def run_test_suite():
     else:
         print("\n⚠️ CẢNH BÁO: CÓ TEST CASE BỊ LỖI, VUI LÒNG KIỂM TRA LẠI LOG CHI TIẾT!")
     print("=" * 90 + "\n")
+    return 0 if failed_count == 0 and total_count > 0 else 1
 
 if __name__ == "__main__":
-    run_test_suite()
+    raise SystemExit(run_test_suite())

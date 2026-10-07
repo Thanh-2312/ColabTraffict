@@ -2,7 +2,7 @@
 """
 Benchmark 4 thuật toán điều khiển đèn giao thông trên GAMA:
 
-    Fixed-Time       -> GAMA headless batch (my_batch_experiment, 2000 cycles)
+    Fixed-Time       -> GAMA headless batch (my_batch_experiment, 8000 cycles)
     MaxPressure      -> như trên
     Q-Learning       -> như trên
     Deep Q-Learning  -> gama-server (port 6868) + dqn_py/evaluate.py,
@@ -13,9 +13,8 @@ Quy trình:
     2. Tổng hợp bảng 6 tiêu chí dạng mean ± std, chọn thuật toán tốt nhất.
     3. Vẽ biểu đồ 6 panel từ series đại diện (run có throughput ở median).
 
-Vì sao phải chạy N lần: batch headless của GAMA không tái lập bit-perfect dù
-khai báo seed (seed ngẫu nhiên cho mỗi simulation + thứ tự nội bộ của JVM),
-nên kết quả 1 lần chạy có nhiễu ±3-5% — so sánh hợp lệ cần nhiều lần chạy.
+Mỗi run dùng một seed ghép cặp và xác minh seed thực tế của mô phỏng.
+Cùng seed chưa đảm bảo cùng demand khi controller và sinh xe dùng chung RNG.
 
 Kết quả (thư mục comparison_results/):
     - {fixed_time,maxpressure,q_learning,dqn}_metrics.csv : series đại diện
@@ -23,27 +22,34 @@ Kết quả (thư mục comparison_results/):
     - bảng mean ± std in ra console
 
 Cách chạy:
-    python3 scripts/compare_4_models.py --runs 5      # benchmark đầy đủ
+    python3 scripts/compare_4_models.py --runs 5 --weights dqn_py/run/train_<timestamp>/best_weights.pt
     python3 scripts/compare_4_models.py --plot-only   # tổng hợp + vẽ từ CSV cũ
 """
 
 import argparse
+import json
 import os
 import re
 import subprocess
+import sys
+import tempfile
+from pathlib import Path
 
 import pandas as pd
+import matplotlib
+matplotlib.use("Agg")
 import matplotlib.pyplot as plt
 
 # --------------------------------------------------------------- Cấu hình ---
-BASE_DIR = "/Users/mac/Documents/GAMA"
+BASE_DIR = str(Path(__file__).resolve().parents[1])
 OUTPUT_DIR = os.path.join(BASE_DIR, "comparison_results")
 
-GAMA_HEADLESS = "/Applications/Gama.app/Contents/headless/gama-headless.sh"
+GAMA_HEADLESS = os.environ.get(
+    "GAMA_HEADLESS", "/Applications/Gama.app/Contents/headless/gama-headless.sh"
+)
 BATCH_EXPERIMENT = "my_batch_experiment"
-HORIZON_CYCLES = 2000        # mỗi lần chạy: 2000 cycles = 200 giây mô phỏng
-FIRST_SEED = 5001            # DQN: episode i dùng seed = FIRST_SEED + i - 1
-                             # (3 model batch để GAMA tự chọn seed mỗi lần chạy)
+HORIZON_CYCLES = 8000        # mỗi lần chạy: 8000 cycles = 800 giây mô phỏng
+FIRST_SEED = 5001
 N_RUNS_DEFAULT = 5
 
 # Tên hiển thị -> (file GAML batch, tên file CSV kết quả)
@@ -56,9 +62,10 @@ DQN_NAME = "Deep Q-Learning"
 MODEL_NAMES = [*BATCH_MODELS, DQN_NAME]
 
 DQN_DIR = os.path.join(BASE_DIR, "dqn_py")
-DQN_PYTHON = os.path.join(DQN_DIR, "venv", "bin", "python")
+DQN_PYTHON = (os.path.join(DQN_DIR, "venv", "bin", "python")
+              if os.path.isfile(os.path.join(DQN_DIR, "venv", "bin", "python"))
+              else sys.executable)
 DQN_EVAL = os.path.join(DQN_DIR, "evaluate.py")
-DQN_WEIGHTS = os.path.join(DQN_DIR, "run", "train_20260829_153936", "best_weights.pt")
 DQN_PORT = 6868              # gama-server chạy sẵn (kiểm tra: lsof -i :6868)
 
 # Dòng "METRIC_CSV,cycle,passed,avg_wait,queue,speed,travel,max_wait" mà
@@ -66,42 +73,80 @@ DQN_PORT = 6868              # gama-server chạy sẵn (kiểm tra: lsof -i :68
 METRIC_CSV_RE = re.compile(
     r"METRIC_CSV,(\d+),(\d+),([\d.]+),(\d+),([\d.]+),([\d.]+),([\d.]+)")
 
+
+def validate_sampling_grid(df, label):
+    expected = list(range(10, HORIZON_CYCLES, 10))
+    actual = df["cycle"].astype(int).tolist()
+    if actual != expected:
+        raise ValueError(
+            f"[{label}] sampling grid differs from cycles 10..{HORIZON_CYCLES - 10} "
+            f"at intervals of 10 (got {len(actual)} rows, first={actual[:3]}, "
+            f"last={actual[-3:]})"
+        )
+
 CHART_PATH = os.path.join(OUTPUT_DIR, "traffic_comparison_4models_6metrics.png")
 COLORS = {"Fixed-Time": "#e74c3c", "MaxPressure": "#2ecc71",
           "Q-Learning": "#3498db", DQN_NAME: "#9b59b6"}
 
 
 # --------------------------------------------------- Chạy 1 model batch GAMA
-def run_batch(model_file, label):
-    """Chạy 1 lần batch headless, trả về DataFrame metrics (199 dòng)."""
+def run_batch(model_file, label, seed):
+    """Chạy 1 lần batch headless, trả về DataFrame metrics (799 dòng)."""
     print(f"🚀 [{label}] batch headless, {HORIZON_CYCLES} cycles...", flush=True)
-    cmd = ["bash", GAMA_HEADLESS, "-batch", BATCH_EXPERIMENT, model_file]
-    process = subprocess.Popen(cmd, stdout=subprocess.PIPE,
-                               stderr=subprocess.STDOUT, text=True, bufsize=1)
-
+    source = f'''model seeded_benchmark
+import "{Path(model_file).name}"
+global {{
+    reflex benchmark_seed_log when: cycle = 0 {{ write "BENCHMARK_SEED," + seed; }}
+}}
+experiment seeded_benchmark_experiment type: batch until: (cycle >= {HORIZON_CYCLES}) {{
+    parameter "Traffic seed" var: traffic_seed init: {float(seed)};
+}}
+'''
+    with tempfile.NamedTemporaryFile("w", suffix=".gaml", prefix="tmp_seeded_benchmark_",
+                                     dir=Path(model_file).parent, delete=False) as stream:
+        stream.write(source)
+        wrapper = Path(stream.name)
+    cmd = ["bash", GAMA_HEADLESS, "-m", "2048m", "-batch",
+           "seeded_benchmark_experiment", str(wrapper)]
     records = []
-    for line in iter(process.stdout.readline, ""):
-        m = METRIC_CSV_RE.search(line)
-        if not m:
-            continue
-        cycle = int(m.group(1))
-        records.append({
-            "cycle": cycle,
-            "time_sec": cycle * 0.1,
-            "throughput": int(m.group(2)),
-            "avg_waiting_time": float(m.group(3)),
-            "queue_length": int(m.group(4)),
-            "avg_speed": float(m.group(5)),
-            "avg_travel_time": float(m.group(6)),
-            "max_waiting_time": float(m.group(7)),
-        })
-    process.stdout.close()
-    process.wait(timeout=60)
+    actual_seed = None
+    log_path = Path(OUTPUT_DIR) / f"{Path(model_file).stem}_seed{seed}.log"
+    try:
+        with tempfile.TemporaryDirectory(prefix="gama_benchmark_") as work, log_path.open("w") as log:
+            with subprocess.Popen(cmd, cwd=work, stdout=subprocess.PIPE,
+                                  stderr=subprocess.STDOUT, text=True, bufsize=1,
+                                  env={**os.environ, "_JAVA_OPTIONS": os.environ.get("_JAVA_OPTIONS", "") +
+                                       " -Xms256m -Xmx2g -XX:-AlwaysPreTouch"}) as process:
+                for line in process.stdout:
+                    log.write(line)
+                    if line.startswith("BENCHMARK_SEED,"):
+                        actual_seed = float(line.split(",", 1)[1])
+                    m = METRIC_CSV_RE.search(line)
+                    if not m:
+                        continue
+                    cycle = int(m.group(1))
+                    records.append({
+                        "seed": seed, "cycle": cycle,
+                        "time_sec": cycle * 0.1,
+                        "throughput": int(m.group(2)),
+                        "avg_waiting_time": float(m.group(3)),
+                        "queue_length": int(m.group(4)),
+                        "avg_speed": float(m.group(5)),
+                        "avg_travel_time": float(m.group(6)),
+                        "max_waiting_time": float(m.group(7)),
+                    })
+            if process.returncode != 0:
+                raise RuntimeError(f"[{label}] GAMA exited with code {process.returncode}; see {log_path}")
+    finally:
+        wrapper.unlink(missing_ok=True)
+    if actual_seed != seed:
+        raise RuntimeError(f"[{label}] requested seed {seed}, actual seed {actual_seed}; see {log_path}")
 
     if not records:
         raise RuntimeError(f"[{label}] Không thu được dòng METRIC_CSV nào - "
                            f"kiểm tra model GAML hoặc tên experiment.")
     df = pd.DataFrame(records)
+    validate_sampling_grid(df, label)
     print(f"✅ [{label}] {len(df)} mẫu (cycle {df['cycle'].min()}"
           f"-{df['cycle'].max()}), throughput={df['throughput'].iloc[-1]}",
           flush=True)
@@ -109,18 +154,19 @@ def run_batch(model_file, label):
 
 
 # ------------------------------------------------------- Đánh giá Deep Q-Net
-def run_dqn(n_episodes):
+def run_dqn(n_episodes, weights_path):
     """Chạy evaluate.py qua gama-server, trả về list DataFrame mỗi episode."""
     print(f"🚀 [{DQN_NAME}] greedy (eps=0) qua gama-server :{DQN_PORT}, "
           f"{n_episodes} episodes (seed {FIRST_SEED}..{FIRST_SEED + n_episodes - 1})...",
           flush=True)
     cmd = [DQN_PYTHON, DQN_EVAL,
-           "--weights", DQN_WEIGHTS,
+           "--weights", weights_path,
            "--episodes", str(n_episodes),
            "--episode-horizon", str(HORIZON_CYCLES),
            "--seed-base", str(FIRST_SEED - 1),   # ep i -> seed = FIRST_SEED + i - 1
            "--port", str(DQN_PORT),
-           "--host", "localhost"]
+           "--host", "localhost",
+           "--output", os.path.join(OUTPUT_DIR, "dqn_metrics.csv")]
     process = subprocess.Popen(cmd, cwd=DQN_DIR, stdout=subprocess.PIPE,
                                stderr=subprocess.STDOUT, text=True, bufsize=1)
     for line in iter(process.stdout.readline, ""):
@@ -136,6 +182,10 @@ def run_dqn(n_episodes):
     csv_path = os.path.join(OUTPUT_DIR, "dqn_metrics.csv")
     df = pd.read_csv(csv_path)
     episodes = [g.reset_index(drop=True) for _, g in df.groupby("episode")]
+    if len(episodes) != n_episodes:
+        raise RuntimeError(f"[{DQN_NAME}] expected {n_episodes} episodes, got {len(episodes)}")
+    for i, episode in enumerate(episodes, 1):
+        validate_sampling_grid(episode, f"{DQN_NAME} episode {i}")
     print(f"✅ [{DQN_NAME}] {len(episodes)} episode -> {csv_path}", flush=True)
     return episodes
 
@@ -225,7 +275,7 @@ def plot(series_by_model):
     fig, axes = plt.subplots(3, 2, figsize=(16, 14))
     fig.suptitle("So Sánh 4 Thuật Toán Điều Khiển Đèn Giao Thông "
                  "(Fixed-Time, MaxPressure, Q-Learning, Deep Q-Learning)\n"
-                 f"2000 cycles (200s) mỗi lần chạy — GAMA Platform",
+                 f"8000 cycles (800s) mỗi lần chạy — GAMA Platform",
                  fontsize=15, fontweight="bold", y=0.99)
 
     panels = [
@@ -267,19 +317,39 @@ def load_saved_series():
         if "episode" in df.columns and df["episode"].nunique() > 1:
             episodes = [g.reset_index(drop=True) for _, g in df.groupby("episode")]
             df = representative(episodes)
+        validate_sampling_grid(df, name)
         series[name] = df.drop(columns=["episode"], errors="ignore")
     return series
 
 
-def main():
+def main(argv=None):
+    global OUTPUT_DIR, CHART_PATH, DQN_PORT, FIRST_SEED
     parser = argparse.ArgumentParser(
         description="Benchmark 4 thuật toán điều khiển đèn giao thông trên GAMA")
     parser.add_argument("--runs", type=int, default=N_RUNS_DEFAULT,
                         help=f"Số lần chạy độc lập mỗi thuật toán "
                              f"(mặc định {N_RUNS_DEFAULT})")
+    parser.add_argument("--weights",
+                        help="DQN checkpoint trained with the current traffic model (required unless --plot-only)")
+    parser.add_argument("--output-dir", default=OUTPUT_DIR,
+                        help="Directory for benchmark CSV files and chart")
+    parser.add_argument("--port", type=int, default=DQN_PORT,
+                        help="Port of the running GAMA server for DQN evaluation")
+    parser.add_argument("--first-seed", type=int, default=FIRST_SEED)
     parser.add_argument("--plot-only", action="store_true",
                         help="Không chạy mô phỏng, chỉ tổng hợp + vẽ từ CSV đã lưu")
-    args = parser.parse_args()
+    args = parser.parse_args(argv)
+    if args.runs < 1:
+        parser.error("--runs must be at least 1")
+    if not args.plot_only and not args.weights:
+        parser.error("--weights is required; train DQN on the current DoAn model first")
+    OUTPUT_DIR = os.path.abspath(args.output_dir)
+    CHART_PATH = os.path.join(OUTPUT_DIR, "traffic_comparison_4models_6metrics.png")
+    DQN_PORT = args.port
+    FIRST_SEED = args.first_seed
+    if args.weights:
+        args.weights = str(Path(args.weights).resolve())
+    os.makedirs(OUTPUT_DIR, exist_ok=True)
     n_runs = 1 if args.plot_only else args.runs
 
     print("=" * 140)
@@ -293,12 +363,48 @@ def main():
         series = load_saved_series()
         reps = {name: [series[name]] for name in MODEL_NAMES}
     else:
+        # Old checkpoints were trained before changes to vehicle dynamics or
+        # observations. Comparing them with newly simulated controllers would
+        # produce a misleading benchmark.
+        model_sources = [
+            os.path.join(BASE_DIR, "Traffic/includes/collision_avoidance.gaml"),
+            os.path.join(BASE_DIR, "Traffic/includes/doan_scenery.gaml"),
+            os.path.join(BASE_DIR, "Traffic/models/intersection-dqn-python.gaml"),
+            os.path.join(DQN_DIR, "gama_env.py"),
+            os.path.join(DQN_DIR, "train.py"),
+        ]
+        if not os.path.isfile(args.weights):
+            raise FileNotFoundError(f"DQN checkpoint not found: {args.weights}")
+        if os.path.getmtime(args.weights) < max(map(os.path.getmtime, model_sources)):
+            raise RuntimeError(
+                "DQN checkpoint predates the current simulation/training code. "
+                "Retrain DQN and pass the new checkpoint with --weights."
+            )
         reps = {name: [] for name in MODEL_NAMES}
         for name, (model_file, csv_stem) in BATCH_MODELS.items():
             model_path = os.path.join(BASE_DIR, "Traffic/models", model_file)
-            reps[name] = [run_batch(model_path, name) for _ in range(n_runs)]
+            reps[name] = []
+            for i in range(n_runs):
+                reps[name].append(run_batch(model_path, name, FIRST_SEED + i))
+                pd.concat([df.assign(episode=j + 1) for j, df in enumerate(reps[name])],
+                          ignore_index=True).to_csv(
+                    os.path.join(OUTPUT_DIR, f"{csv_stem}_all_runs.csv"), index=False)
             save_series(representative(reps[name]), csv_stem)
-        reps[DQN_NAME] = run_dqn(n_runs)
+        reps[DQN_NAME] = run_dqn(n_runs, args.weights)
+
+    summaries = []
+    for name, runs in reps.items():
+        for i, df in enumerate(runs):
+            summaries.append(dict(method=name, episode=i + 1,
+                                  **per_run_values(df)))
+    pd.DataFrame(summaries).to_csv(os.path.join(OUTPUT_DIR, "per_run_summary.csv"), index=False)
+    if not args.plot_only:
+        Path(OUTPUT_DIR, "benchmark_manifest.json").write_text(json.dumps(dict(
+            seeds=list(range(FIRST_SEED, FIRST_SEED + n_runs)),
+            horizon=HORIZON_CYCLES, weights=args.weights,
+            limitations=["Shared RNG and rejected spawn requests can change demand between methods",
+                         "Native Q-Learning trains online from zero during each evaluation run",
+                         "DQN checkpoint quality must be assessed separately"]), indent=2) + "\n")
 
     report(reps, n_runs)
     plot({name: representative(reps[name]) for name in MODEL_NAMES})
@@ -307,5 +413,3 @@ def main():
 
 if __name__ == "__main__":
     main()
-
-

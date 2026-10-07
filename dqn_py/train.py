@@ -37,8 +37,8 @@ BASE_DIR = os.path.dirname(os.path.abspath(__file__))
 def parse_args():
     p = argparse.ArgumentParser(description="Train DQN traffic controller")
     p.add_argument("--episodes", type=int, default=150)
-    p.add_argument("--episode-horizon", type=int, default=2000,
-                   help="So cycle GAMA moi episode (2000 cycle = 200s, giong batch cac model khac)")
+    p.add_argument("--episode-horizon", type=int, default=8000,
+                   help="So cycle GAMA moi episode (8000 cycle = 800s, giong batch cac model khac)")
     p.add_argument("--port", type=int, default=6868)
     p.add_argument("--host", type=str, default="localhost")
     p.add_argument("--start-server", action="store_true",
@@ -72,11 +72,11 @@ async def amain():
     print(f"[Train] Ket qua se luu tai: {outdir}")
 
     # 1. Server
-    manager = None
-    if args.start_server:
-        manager = GamaServerManager(port=args.port)
-        manager.start()
+    manager = GamaServerManager(port=args.port) if args.start_server else None
+    env = None
     try:
+        if manager is not None:
+            manager.start()
         # 2. Environment + Agent
         env = GamaTrafficEnv(
             host=args.host, port=args.port,
@@ -108,6 +108,13 @@ async def amain():
             t0 = time.time()
             seed = args.seed_base + ep
             state = await env.reset(seed=seed)
+            # The controller first requests an action at cycle 100.  A call to
+            # env.step() before then would store a transition for an action
+            # that GAMA has not applied.
+            await env.step_cycles(state["next_decision_in_cycles"])
+            state = await env.read_state()
+            if not state["dqn_waiting_action"]:
+                raise RuntimeError("GAMA did not reach the first DQN decision")
 
             ep_reward = 0.0
             decisions = 0
@@ -159,10 +166,13 @@ async def amain():
         print(f"[Train] Weights cuoi cung : {final_path}")
         print(f"[Train] Weights tot nhat  : {os.path.join(outdir, 'best_weights.pt')}")
         print(f"[Train] Log huan luyen    : {log_path}")
-        await env.close()
     finally:
-        if manager is not None and not args.keep_server:
-            manager.stop()
+        try:
+            if env is not None:
+                await env.close()
+        finally:
+            if manager is not None and not args.keep_server:
+                manager.stop()
 
 
 if __name__ == "__main__":

@@ -1,257 +1,195 @@
 #!/usr/bin/env python3
-"""
-==============================================================================
-TRAFFIC SIGNAL CONTROL BENCHMARK: FIXED-TIME vs MAXPRESSURE vs Q-LEARNING
-==============================================================================
-So sánh 6 tiêu chí đánh giá hiệu năng giao thông trên 3 thuật toán điều khiển:
-  1. Throughput (Tổng số xe qua ngã tư)          [Cao hơn là tốt hơn]
-  2. Average Waiting Time (Thời gian chờ TB)     [Thấp hơn là tốt hơn]
-  3. Average Queue Length (Chiều dài hàng đợi TB)[Thấp hơn là tốt hơn]
-  4. Average Speed (Vận tốc trung bình)          [Cao hơn là tốt hơn]
-  5. Average Travel Time (Thời gian hành trình)  [Thấp hơn là tốt hơn]
-  6. Max Waiting Time (Thời gian chờ tối đa)     [Thấp hơn là tốt hơn]
-==============================================================================
-"""
+"""Compare mobility and safety metrics for the three GAMA controllers."""
 
+import argparse
 import os
-import sys
-import subprocess
 import re
-import pandas as pd
-import numpy as np
+import subprocess
+import tempfile
+from pathlib import Path
+
+import matplotlib
+matplotlib.use("Agg")
 import matplotlib.pyplot as plt
+import numpy as np
+import pandas as pd
 
-# Đường dẫn GAMA và các file mô hình
-GAMA_HEADLESS = "/Applications/Gama.app/Contents/headless/gama-headless.sh"
-BASE_DIR = "/Users/mac/Documents/GAMA"
-FIXED_TIME_MODEL = os.path.join(BASE_DIR, "Traffic/models/intersection-fixed-time.gaml")
-MAXPRESSURE_MODEL = os.path.join(BASE_DIR, "Traffic/models/intersection-maxpressure.gaml")
-QLEARNING_MODEL = os.path.join(BASE_DIR, "Traffic/models/intersection-qlearning.gaml")
-OUTPUT_DIR = os.path.join(BASE_DIR, "comparison_results")
-os.makedirs(OUTPUT_DIR, exist_ok=True)
 
-def run_simulation(model_path, model_name):
-    """Chạy mô phỏng GAMA headless và trích xuất dữ liệu 6 metrics."""
-    print(f"\n🚀 Đang chạy mô phỏng: {model_name}...")
-    cmd = [
-        "bash", GAMA_HEADLESS,
-        "-batch", "my_batch_experiment",
-        model_path
-    ]
-    
-    process = subprocess.Popen(
-        cmd, stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
-        text=True, bufsize=1
+ROOT = Path(__file__).resolve().parents[1]
+GAMA_HEADLESS = Path(os.environ.get(
+    "GAMA_HEADLESS", "/Applications/Gama.app/Contents/headless/gama-headless.sh"
+))
+MODELS = {
+    "Fixed-Time": ("intersection-fixed-time.gaml", "fixed_time", "#e74c3c"),
+    "MaxPressure": ("intersection-maxpressure.gaml", "maxpressure", "#2ecc71"),
+    "Q-Learning": ("intersection-qlearning.gaml", "q_learning", "#3498db"),
+}
+MOBILITY_FIELDS = (
+    "cycle", "throughput", "avg_waiting_time", "queue_length", "avg_speed",
+    "avg_travel_time", "max_waiting_time",
+)
+SAFETY_FIELDS = (
+    "cycle", "TIT_total", "DRAC_max", "TTC_lt1_count", "hard_brakes",
+    "PET_lt1_5_count", "min_PET", "DZ_count",
+)
+MOBILITY_PATTERN = re.compile(r"METRIC_CSV,(\d+),(\d+),([\d.]+),(\d+),([\d.]+),([\d.]+),([\d.]+)")
+SAFETY_PATTERN = re.compile(r"SAFETY_CSV,(\d+),([\d.]+),([\d.]+),(\d+),(\d+),(\d+),([\d.]+),(\d+)")
+INTEGER_FIELDS = {
+    "cycle", "throughput", "queue_length", "TTC_lt1_count", "hard_brakes",
+    "PET_lt1_5_count", "DZ_count",
+}
+
+# (column, label, unit, aggregation, higher is better)
+MOBILITY_METRICS = (
+    ("throughput", "Throughput (Tổng xe qua)", "xe", "last", True),
+    ("avg_waiting_time", "Average Waiting Time", "s", "mean", False),
+    ("queue_length", "Average Queue Length", "xe", "mean", False),
+    ("avg_speed", "Average Speed", "km/h", "mean", True),
+    ("avg_travel_time", "Average Travel Time", "s", "last", False),
+    ("max_waiting_time", "Max Waiting Time (Fairness)", "s", "max", False),
+)
+SAFETY_METRICS = (
+    ("TIT_total", "Total TIT (Tích phân rủi ro)", "s", "last", False),
+    ("TTC_lt1_count", "Severe Conflicts (TTC < 1.0s)", "lần", "last", False),
+    ("hard_brakes", "Hard Braking (a < -3.4m/s²)", "lần", "last", False),
+    ("PET_lt1_5_count", "PET Near-Miss (PET < 1.5s)", "lần", "last", False),
+    ("min_PET", "Min Observed PET", "s", "min", True),
+    ("DRAC_max", "Max Observed DRAC", "m/s²", "max", False),
+    ("DZ_count", "Dilemma Zone Vehicles", "xe", "last", False),
+)
+
+
+def parse_record(line, pattern, fields):
+    """Extract one metric record from a GAMA log line."""
+    match = pattern.search(line)
+    if not match:
+        return None
+    values = match.groups()
+    cycle = int(values[0])
+    record = {"cycle": cycle, "time_sec": cycle * 0.1}
+    record.update(
+        (field, int(value) if field in INTEGER_FIELDS else float(value))
+        for field, value in zip(fields[1:], values[1:])
     )
-    
-    records = []
-    pattern = re.compile(r"METRIC_CSV,(\d+),(\d+),([\d\.]+),(\d+),([\d\.]+),([\d\.]+),([\d\.]+)")
-    
-    for line in iter(process.stdout.readline, ''):
-        match = pattern.search(line)
-        if match:
-            cycle = int(match.group(1))
-            passed = int(match.group(2))
-            avg_wait = float(match.group(3))
-            queue = int(match.group(4))
-            avg_speed = float(match.group(5))
-            avg_travel = float(match.group(6))
-            max_wait = float(match.group(7))
-            
-            records.append({
-                "cycle": cycle,
-                "time_sec": cycle * 0.1,
-                "throughput": passed,
-                "avg_waiting_time": avg_wait,
-                "queue_length": queue,
-                "avg_speed": avg_speed,
-                "avg_travel_time": avg_travel,
-                "max_waiting_time": max_wait
-            })
-            if cycle % 400 == 0:
-                print(f"   ⏳ [{model_name}] Cycle {cycle:4d} ({cycle*0.1:4.0f}s) | Xe qua: {passed:3d} | Hàng đợi: {queue:2d} | Vận tốc: {avg_speed:4.1f} km/h")
-                
-    process.wait()
-    df = pd.DataFrame(records)
-    csv_path = os.path.join(OUTPUT_DIR, f"{model_name.lower().replace('-', '_')}_metrics.csv")
-    df.to_csv(csv_path, index=False)
-    print(f"✅ Hoàn thành {model_name}! Thu thập được {len(df)} mẫu dữ liệu. Đã lưu: {csv_path}")
-    return df
+    return record
 
-def generate_comparison_report(df_ft, df_mp, df_ql):
-    """Tính toán bảng so sánh chi tiết 6 tiêu chí cho cả 3 thuật toán."""
-    metrics_summary = [
-        {
-            "id": 1,
-            "name": "Throughput (Tổng xe qua)",
-            "unit": "xe",
-            "higher_is_better": True,
-            "ft_val": df_ft["throughput"].iloc[-1],
-            "mp_val": df_mp["throughput"].iloc[-1],
-            "ql_val": df_ql["throughput"].iloc[-1],
-        },
-        {
-            "id": 2,
-            "name": "Average Waiting Time",
-            "unit": "s",
-            "higher_is_better": False,
-            "ft_val": df_ft["avg_waiting_time"].mean(),
-            "mp_val": df_mp["avg_waiting_time"].mean(),
-            "ql_val": df_ql["avg_waiting_time"].mean(),
-        },
-        {
-            "id": 3,
-            "name": "Average Queue Length",
-            "unit": "xe",
-            "higher_is_better": False,
-            "ft_val": df_ft["queue_length"].mean(),
-            "mp_val": df_mp["queue_length"].mean(),
-            "ql_val": df_ql["queue_length"].mean(),
-        },
-        {
-            "id": 4,
-            "name": "Average Speed",
-            "unit": "km/h",
-            "higher_is_better": True,
-            "ft_val": df_ft["avg_speed"].mean(),
-            "mp_val": df_mp["avg_speed"].mean(),
-            "ql_val": df_ql["avg_speed"].mean(),
-        },
-        {
-            "id": 5,
-            "name": "Average Travel Time",
-            "unit": "s",
-            "higher_is_better": False,
-            "ft_val": df_ft["avg_travel_time"].iloc[-1],
-            "mp_val": df_mp["avg_travel_time"].iloc[-1],
-            "ql_val": df_ql["avg_travel_time"].iloc[-1],
-        },
-        {
-            "id": 6,
-            "name": "Max Waiting Time (Fairness)",
-            "unit": "s",
-            "higher_is_better": False,
-            "ft_val": df_ft["max_waiting_time"].max(),
-            "mp_val": df_mp["max_waiting_time"].max(),
-            "ql_val": df_ql["max_waiting_time"].max(),
-        }
-    ]
-    
-    print("\n" + "="*95)
-    print("        BẢNG TỔNG HỢP SO SÁNH 6 TIÊU CHÍ HIỆU NĂNG: FIXED-TIME vs MAXPRESSURE vs Q-LEARNING")
-    print("="*95)
-    print(f"{'Tiêu chí đánh giá':<28} | {'Fixed-Time':<12} | {'MaxPressure':<12} | {'Q-Learning':<12} | {'Thuật toán Tốt nhất':<18}")
-    print("-"*95)
-    
-    for m in metrics_summary:
-        ft = m["ft_val"]
-        mp = m["mp_val"]
-        ql = m["ql_val"]
-        higher_better = m["higher_is_better"]
-        
-        vals = {"Fixed-Time": ft, "MaxPressure": mp, "Q-Learning": ql}
-        if higher_better:
-            best_name = max(vals, key=vals.get)
-        else:
-            best_name = min(vals, key=vals.get)
-            
-        winner = f"🏆 {best_name}"
-        
-        print(f"{m['name']:<28} | {ft:8.2f} {m['unit']:<3} | {mp:8.2f} {m['unit']:<3} | {ql:8.2f} {m['unit']:<3} | {winner:<18}")
-        
-    print("="*95)
 
-def plot_charts(df_ft, df_mp, df_ql):
-    """Vẽ biểu đồ so sánh trực quan 6 tiêu chí trên 3 thuật toán."""
-    plt.style.use('seaborn-v0_8-whitegrid' if 'seaborn-v0_8-whitegrid' in plt.style.available else 'default')
+def run_simulation(model_path, model_name, output_dir):
+    """Run GAMA and save CSVs only after a successful simulation."""
+    print(f"\n🚀 Đang chạy mô phỏng: {model_name}...", flush=True)
+    command = ["bash", str(GAMA_HEADLESS), "-batch", "my_batch_experiment", str(model_path)]
+    mobility, safety = [], []
+    with tempfile.TemporaryDirectory(prefix="gama_comparison_") as work:
+        with subprocess.Popen(command, cwd=work, stdout=subprocess.PIPE,
+                              stderr=subprocess.STDOUT, text=True, bufsize=1) as process:
+            for line in process.stdout:
+                metric = parse_record(line, MOBILITY_PATTERN, MOBILITY_FIELDS)
+                if metric:
+                    mobility.append(metric)
+                    if metric["cycle"] % 400 == 0:
+                        print(f"   [{model_name}] cycle {metric['cycle']}: "
+                              f"passed={metric['throughput']:.0f}, queue={metric['queue_length']:.0f}")
+                safety_record = parse_record(line, SAFETY_PATTERN, SAFETY_FIELDS)
+                if safety_record:
+                    safety.append(safety_record)
+    if process.returncode != 0:
+        raise RuntimeError(f"{model_name}: GAMA exited with code {process.returncode}")
+    if not mobility:
+        raise RuntimeError(f"{model_name}: no METRIC_CSV rows; check model and experiment")
+
+    expected = list(range(10, 8000, 10))
+    for kind, records in (("mobility", mobility), ("safety", safety)):
+        if [row["cycle"] for row in records] != expected:
+            raise RuntimeError(f"{model_name}: incomplete {kind} sampling grid (expected cycles 10..7990)")
+    metric_df = pd.DataFrame(mobility)
+    safety_df = pd.DataFrame(safety)
+    stem = MODELS[model_name][1]
+    metric_df.to_csv(output_dir / f"{stem}_metrics.csv", index=False)
+    safety_df.to_csv(output_dir / f"{stem}_safety.csv", index=False)
+    print(f"✅ {model_name}: {len(metric_df)} mobility, {len(safety_df)} safety samples")
+    return metric_df, safety_df
+
+
+def aggregate(df, column, method):
+    series = df[column]
+    if method == "last":
+        return series.iloc[-1]
+    return getattr(series, method)()
+
+
+def print_summary(title, datasets, definitions):
+    print(f"\n{title}")
+    print(f"{'Metric':<38} | " + " | ".join(f"{name:>14}" for name in MODELS) + " | Best")
+    for column, label, unit, method, higher_is_better in definitions:
+        values = {name: aggregate(df, column, method) for name, df in datasets.items()}
+        best = (max if higher_is_better else min)(values, key=values.get)
+        cells = " | ".join(f"{values[name]:>10.2f} {unit:<3}" for name in MODELS)
+        print(f"{label:<38} | {cells} | {best}")
+
+
+def plot_mobility(datasets, path):
     fig, axes = plt.subplots(3, 2, figsize=(16, 14))
-    fig.suptitle("So Sánh Hiệu Năng: Fixed-Time vs MaxPressure vs Q-Learning (6 Tiêu Chí)", fontsize=17, fontweight='bold', y=0.98)
-    
-    colors = {"FT": "#e74c3c", "MP": "#2ecc71", "QL": "#3498db"}
-    
-    # 1. Throughput
-    ax = axes[0, 0]
-    ax.plot(df_ft["time_sec"], df_ft["throughput"], label="Fixed-Time", color=colors["FT"], lw=2.2)
-    ax.plot(df_mp["time_sec"], df_mp["throughput"], label="MaxPressure", color=colors["MP"], lw=2.2)
-    ax.plot(df_ql["time_sec"], df_ql["throughput"], label="Q-Learning", color=colors["QL"], lw=2.2, linestyle="--")
-    ax.set_title("1. Throughput (Tổng số xe qua ngã tư) [↑ Cao hơn là tốt]", fontsize=12, fontweight='bold')
-    ax.set_xlabel("Thời gian mô phỏng (giây)")
-    ax.set_ylabel("Số xe")
-    ax.legend(loc="upper left")
-    ax.grid(True, linestyle="--", alpha=0.6)
-    
-    # 2. Average Waiting Time
-    ax = axes[0, 1]
-    ax.plot(df_ft["time_sec"], df_ft["avg_waiting_time"], label="Fixed-Time", color=colors["FT"], lw=2)
-    ax.plot(df_mp["time_sec"], df_mp["avg_waiting_time"], label="MaxPressure", color=colors["MP"], lw=2)
-    ax.plot(df_ql["time_sec"], df_ql["avg_waiting_time"], label="Q-Learning", color=colors["QL"], lw=2, linestyle="--")
-    ax.set_title("2. Average Waiting Time (Thời gian chờ TB) [↓ Thấp hơn là tốt]", fontsize=12, fontweight='bold')
-    ax.set_xlabel("Thời gian mô phỏng (giây)")
-    ax.set_ylabel("Giây (s)")
-    ax.legend()
-    ax.grid(True, linestyle="--", alpha=0.6)
-    
-    # 3. Queue Length
-    ax = axes[1, 0]
-    ax.plot(df_ft["time_sec"], df_ft["queue_length"], label="Fixed-Time", color=colors["FT"], alpha=0.8, lw=1.8)
-    ax.plot(df_mp["time_sec"], df_mp["queue_length"], label="MaxPressure", color=colors["MP"], alpha=0.8, lw=1.8)
-    ax.plot(df_ql["time_sec"], df_ql["queue_length"], label="Q-Learning", color=colors["QL"], alpha=0.8, lw=1.8, linestyle="--")
-    ax.set_title("3. Queue Length (Chiều dài hàng đợi xếp hàng) [↓ Thấp hơn là tốt]", fontsize=12, fontweight='bold')
-    ax.set_xlabel("Thời gian mô phỏng (giây)")
-    ax.set_ylabel("Số xe kẹt")
-    ax.legend()
-    ax.grid(True, linestyle="--", alpha=0.6)
-    
-    # 4. Average Speed
-    ax = axes[1, 1]
-    ax.plot(df_ft["time_sec"], df_ft["avg_speed"], label="Fixed-Time", color=colors["FT"], lw=2)
-    ax.plot(df_mp["time_sec"], df_mp["avg_speed"], label="MaxPressure", color=colors["MP"], lw=2)
-    ax.plot(df_ql["time_sec"], df_ql["avg_speed"], label="Q-Learning", color=colors["QL"], lw=2, linestyle="--")
-    ax.set_title("4. Average Speed (Vận tốc trung bình toàn mạng) [↑ Cao hơn là tốt]", fontsize=12, fontweight='bold')
-    ax.set_xlabel("Thời gian mô phỏng (giây)")
-    ax.set_ylabel("km/h")
-    ax.legend()
-    ax.grid(True, linestyle="--", alpha=0.6)
-    
-    # 5. Average Travel Time
-    ax = axes[2, 0]
-    ax.plot(df_ft["time_sec"], df_ft["avg_travel_time"], label="Fixed-Time", color=colors["FT"], lw=2)
-    ax.plot(df_mp["time_sec"], df_mp["avg_travel_time"], label="MaxPressure", color=colors["MP"], lw=2)
-    ax.plot(df_ql["time_sec"], df_ql["avg_travel_time"], label="Q-Learning", color=colors["QL"], lw=2, linestyle="--")
-    ax.set_title("5. Average Travel Time (Thời gian hoàn thành chuyến đi) [↓ Thấp hơn là tốt]", fontsize=12, fontweight='bold')
-    ax.set_xlabel("Thời gian mô phỏng (giây)")
-    ax.set_ylabel("Giây (s)")
-    ax.legend()
-    ax.grid(True, linestyle="--", alpha=0.6)
-    
-    # 6. Max Waiting Time
-    ax = axes[2, 1]
-    ax.plot(df_ft["time_sec"], df_ft["max_waiting_time"], label="Fixed-Time", color=colors["FT"], lw=2)
-    ax.plot(df_mp["time_sec"], df_mp["max_waiting_time"], label="MaxPressure", color=colors["MP"], lw=2)
-    ax.plot(df_ql["time_sec"], df_ql["max_waiting_time"], label="Q-Learning", color=colors["QL"], lw=2, linestyle="--")
-    ax.set_title("6. Max Waiting Time (Thời gian chờ tối đa - Độ công bằng) [↓ Thấp hơn là tốt]", fontsize=12, fontweight='bold')
-    ax.set_xlabel("Thời gian mô phỏng (giây)")
-    ax.set_ylabel("Giây (s)")
-    ax.legend()
-    ax.grid(True, linestyle="--", alpha=0.6)
-    
-    plt.tight_layout(rect=[0, 0, 1, 0.96])
-    chart_path = os.path.join(OUTPUT_DIR, "traffic_comparison_3models_6metrics.png")
-    plt.savefig(chart_path, dpi=300)
-    print(f"📊 Đã tạo biểu đồ so sánh 3 mô hình độ phân giải cao: {chart_path}")
+    fig.suptitle("So Sánh Hiệu Năng Lưu Thông", fontsize=16, fontweight="bold")
+    for ax, (column, label, _, _, _) in zip(axes.flat, MOBILITY_METRICS):
+        for name, df in datasets.items():
+            ax.plot(df["time_sec"], df[column], label=name, color=MODELS[name][2],
+                    lw=2.2, linestyle="--" if name == "Q-Learning" else "-")
+        ax.set(title=label, xlabel="Thời gian mô phỏng (giây)")
+        ax.grid(True, linestyle="--", alpha=0.6)
+        ax.legend()
+    fig.tight_layout(rect=(0, 0, 1, 0.96))
+    fig.savefig(path, dpi=300)
+    plt.close(fig)
+    print(f"📊 {path}")
+
+
+def plot_safety(datasets, path):
+    fig, axes = plt.subplots(2, 2, figsize=(14, 10))
+    fig.suptitle("So Sánh Chỉ Số An Toàn Vi Mô (SSM)", fontsize=15, fontweight="bold")
+    for ax, column, title in zip(
+        (axes[0, 0], axes[0, 1], axes[1, 0]),
+        ("TIT_total", "TTC_lt1_count", "hard_brakes"),
+        ("Total TIT [↓]", "TTC < 1.0s [↓]", "Hard Braking [↓]"),
+    ):
+        for name, df in datasets.items():
+            ax.plot(df["time_sec"], df[column], label=name, color=MODELS[name][2], lw=2)
+        ax.set(title=title, xlabel="Thời gian (giây)")
+        ax.grid(True, linestyle="--", alpha=0.6)
+        ax.legend()
+
+    categories = ("Severe TTC", "Hard Brakes", "PET < 1.5s")
+    columns = ("TTC_lt1_count", "hard_brakes", "PET_lt1_5_count")
+    positions = np.arange(len(categories))
+    for index, (name, df) in enumerate(datasets.items()):
+        values = [df[column].iloc[-1] for column in columns]
+        axes[1, 1].bar(positions + (index - 1) * 0.25, values, 0.25,
+                       label=name, color=MODELS[name][2])
+    axes[1, 1].set_xticks(positions, categories)
+    axes[1, 1].set_title("Tổng kết chỉ số sự cố an toàn [↓]")
+    axes[1, 1].grid(True, linestyle="--", alpha=0.6)
+    axes[1, 1].legend()
+    fig.tight_layout(rect=(0, 0, 1, 0.96))
+    fig.savefig(path, dpi=300)
+    plt.close(fig)
+    print(f"📊 {path}")
+
 
 def main():
-    print("="*95)
-    print(" BẮT ĐẦU CHẠY THỬ NGHIỆM ĐÁNH GIÁ SO SÁNH 3 MÔ HÌNH: FIXED-TIME vs MAXPRESSURE vs Q-LEARNING")
-    print("="*95)
-    
-    df_fixed_time = run_simulation(FIXED_TIME_MODEL, "Fixed-Time")
-    df_maxpressure = run_simulation(MAXPRESSURE_MODEL, "MaxPressure")
-    df_qlearning = run_simulation(QLEARNING_MODEL, "Q-Learning")
-    
-    generate_comparison_report(df_fixed_time, df_maxpressure, df_qlearning)
-    plot_charts(df_fixed_time, df_maxpressure, df_qlearning)
-    print("\n🎉 Hoàn thành xuất sắc toàn bộ quy trình thử nghiệm và so sánh!")
+    parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument("--output-dir", type=Path, default=ROOT / "comparison_results")
+    args = parser.parse_args()
+    args.output_dir.mkdir(parents=True, exist_ok=True)
+    mobility, safety = {}, {}
+    for name, (filename, _, _) in MODELS.items():
+        mobility[name], safety[name] = run_simulation(
+            ROOT / "Traffic" / "models" / filename, name, args.output_dir)
+
+    print_summary("6 CHỈ SỐ LƯU THÔNG", mobility, MOBILITY_METRICS)
+    plot_mobility(mobility, args.output_dir / "traffic_comparison_3models_mobility.png")
+    if all(not df.empty for df in safety.values()):
+        print_summary("7 CHỈ SỐ AN TOÀN VI MÔ", safety, SAFETY_METRICS)
+        plot_safety(safety, args.output_dir / "traffic_comparison_3models_safety.png")
+
 
 if __name__ == "__main__":
     main()

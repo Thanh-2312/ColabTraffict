@@ -10,7 +10,7 @@ compare_traffic_control.py:
     cycle, time_sec, throughput, avg_waiting_time, queue_length,
     avg_speed, avg_travel_time, max_waiting_time, episode
 
-Ket qua: /Users/mac/Documents/GAMA/comparison_results/dqn_metrics.csv
+Ket qua: comparison_results/dqn_metrics.csv
 -> co the ghep thang vao pipeline so sanh 4 thuat toan.
 
 Vi du:
@@ -32,12 +32,28 @@ BASE_DIR = os.path.dirname(os.path.abspath(__file__))
 COMPARISON_DIR = os.path.join(os.path.dirname(BASE_DIR), "comparison_results")
 
 
+def write_sample(writer, state, episode, horizon):
+    if state["cycle"] % 10 != 0 or state["cycle"] >= horizon:
+        return False
+    writer.writerow({
+        "episode": episode, "cycle": state["cycle"],
+        "time_sec": round(state["cycle"] * 0.1, 1),
+        "throughput": state["total_vehicles_passed"],
+        "avg_waiting_time": state["average_waiting_time"],
+        "queue_length": state["current_queue_length"],
+        "avg_speed": state["average_speed"],
+        "avg_travel_time": state["average_travel_time"],
+        "max_waiting_time": state["max_waiting_time"],
+    })
+    return True
+
+
 def parse_args():
     p = argparse.ArgumentParser(description="Evaluate trained DQN traffic controller")
     p.add_argument("--weights", type=str, required=True,
                    help="File dqn_weights.pt / best_weights.pt tu train.py")
     p.add_argument("--episodes", type=int, default=1)
-    p.add_argument("--episode-horizon", type=int, default=2000)
+    p.add_argument("--episode-horizon", type=int, default=8000)
     p.add_argument("--seed-base", type=int, default=5000,
                    help="Seed danh gia (khac voi seed train de tranh overfit)")
     p.add_argument("--port", type=int, default=6868)
@@ -58,11 +74,11 @@ def parse_args():
 async def amain():
     args = parse_args()
 
-    manager = None
-    if args.start_server:
-        manager = GamaServerManager(port=args.port)
-        manager.start()
+    manager = GamaServerManager(port=args.port) if args.start_server else None
+    env = None
     try:
+        if manager is not None:
+            manager.start()
         env = GamaTrafficEnv(host=args.host, port=args.port,
                              experiment=args.experiment,
                              w_queue=args.w_queue, w_wait=args.w_wait)
@@ -72,7 +88,7 @@ async def amain():
         agent.eps = 0.0
         print(f"[Eval] Da load weights: {args.weights} | policy = GREEDY (eps=0)")
 
-        os.makedirs(os.path.dirname(args.output), exist_ok=True)
+        os.makedirs(os.path.dirname(os.path.abspath(args.output)), exist_ok=True)
         fieldnames = ["episode", "cycle", "time_sec", "throughput", "avg_waiting_time",
                       "queue_length", "avg_speed", "avg_travel_time", "max_waiting_time"]
         n_rows = 0
@@ -100,21 +116,22 @@ async def amain():
                         await env.step_cycles(1)             # handshake
                         nb = await env.get_next_decision_in()
                         decisions += 1
-                    chunk = max(1, min(nb, 10))
+                        state = await env.read_state()
+                        if write_sample(writer, state, ep, args.episode_horizon):
+                            n_rows += 1
+                    # Match GAMA's METRIC_CSV sampling grid exactly: cycles
+                    # 10, 20, ..., horizon-10. Handshake cycles must not
+                    # shift the sampling grid or extend the episode.
+                    until_sample = 10 - state["cycle"] % 10
+                    chunk = min(nb, until_sample,
+                                args.episode_horizon - state["cycle"])
+                    if chunk <= 0:
+                        raise RuntimeError("Invalid DQN evaluation schedule")
                     await env.step_cycles(chunk)
                     nb -= chunk
                     state = await env.read_state()
-                    writer.writerow({
-                        "episode": ep, "cycle": state["cycle"],
-                        "time_sec": round(state["cycle"] * 0.1, 1),
-                        "throughput": state["total_vehicles_passed"],
-                        "avg_waiting_time": state["average_waiting_time"],
-                        "queue_length": state["current_queue_length"],
-                        "avg_speed": state["average_speed"],
-                        "avg_travel_time": state["average_travel_time"],
-                        "max_waiting_time": state["max_waiting_time"],
-                    })
-                    n_rows += 1
+                    if write_sample(writer, state, ep, args.episode_horizon):
+                        n_rows += 1
 
                 print(f"[Eval] Ep {ep} | seed={seed} | reward={ep_reward:.1f} "
                       f"| decisions={decisions} | passed={state['total_vehicles_passed']} "
@@ -127,10 +144,13 @@ async def amain():
         print(f"\n[Eval] Da ghi {n_rows} dong -> {args.output}")
         print("[Eval] Ghep voi 3 model khac: python3 compare_traffic_control.py "
               "(hoac doc README.md)")
-        await env.close()
     finally:
-        if manager is not None and not args.keep_server:
-            manager.stop()
+        try:
+            if env is not None:
+                await env.close()
+        finally:
+            if manager is not None and not args.keep_server:
+                manager.stop()
 
 
 if __name__ == "__main__":

@@ -11,20 +11,19 @@ global {
 	// =====================================================
 	// Q-LEARNING REINFORCEMENT LEARNING CONTROLLER
 	// =====================================================
-	// Phase 0: NS-GREEN, Phase 1: NS-YELLOW (3s fixed)
-	// Phase 2: EW-GREEN, Phase 3: EW-YELLOW (3s fixed)
-	float phase_timer <- 0.0;
-	
+	// 0/4: through green, 1/5: through yellow,
+	// 2/6: protected left green, 3/7: left yellow.
 	// Timing & Safety constraints
 	float min_green_time <- 10#s;   // Thời gian xanh tối thiểu (tránh đổi liên tục)
 	float max_green_time <- 60#s;   // Thời gian xanh tối đa (tránh starvation)
 	float yellow_time <- 3#s;       // Thời gian đèn vàng an toàn
+	float left_green_time <- 12#s;  // Guaranteed protected left-turn service
 	float decision_interval <- 5#s; // AI quyết định mỗi 5 giây
 	
 	// Q-Learning Hyperparameters
 	float alpha_lr <- 0.1;          // Tốc độ học (Learning rate)
 	float gamma_discount <- 0.9;    // Hệ số chiết khấu (Discount factor)
-	float epsilon <- 0.5;           // Xác suất khám phá (Exploration rate)
+	float epsilon <- 0.5;           // Xác suất kháĐm phá (Exploration rate)
 	float epsilon_decay <- 0.995;   // Giảm dần khám phá
 	float epsilon_min <- 0.05;      // Mức khám phá tối thiểu
 	
@@ -49,7 +48,7 @@ global {
 		// (chi hoc trong 1-2 state thay vi 18). Khoi tao muon nhu model DQN.
 
 		// Khởi tạo Q-Table với các giá trị mặc định cho 18 states (2 pha xanh x 3 NS x 3 EW)
-		loop p over: [0, 2] {
+		loop p over: [0, 4] {
 			loop n_lvl over: [0, 1, 2] {
 				loop e_lvl over: [0, 1, 2] {
 					string st <- "" + p + "_" + n_lvl + "_" + e_lvl;
@@ -61,24 +60,29 @@ global {
 
 	// Khoi tao muon danh sach duong vao khi mang duong da san sang
 	reflex init_road_lists when: (empty(ns_incoming_roads) and length(intersection) > 3) {
-		ns_incoming_roads <- intersection(1).incoming_outer_roads + intersection(3).incoming_outer_roads;
-		ew_incoming_roads <- intersection(0).incoming_outer_roads + intersection(2).incoming_outer_roads;
+		ns_incoming_roads <- controller_roads(true,true);
+		ew_incoming_roads <- controller_roads(false,true);
 	}
 	
 	// =====================================================
 	// Q-LEARNING CONTROLLER REFLEX
 	// =====================================================
 	reflex qlearning_controller {
-		phase_timer <- phase_timer + step;
+		phase_timer <- (round(phase_timer / step) + 1) * step;
 		
-		// --- YELLOW PHASES (1, 3): Chuyển tiếp 3s cố định đảm bảo an toàn ---
-		if (global_phase = 1 or global_phase = 3) {
+		// Yellow phases clear the intersection before the next movement opens.
+		if (global_phase mod 2 = 1) {
 			if (phase_timer >= yellow_time) {
 				phase_timer <- 0.0;
-				global_phase <- (global_phase + 1) mod 4;
+				global_phase <- (global_phase + 1) mod 8;
 			}
-		} 
-		// --- GREEN PHASES (0, 2): AI Q-Learning ra quyết định ---
+		} else if (global_phase = 2 or global_phase = 6) {
+			if (phase_timer >= left_green_time) {
+				phase_timer <- 0.0;
+				global_phase <- global_phase + 1;
+			}
+		}
+		// Q-learning controls the through greens; left greens run for 12s.
 		else {
 			bool check_now <- (phase_timer >= min_green_time) and 
 			                  (round(phase_timer * 10) mod int(decision_interval * 10) = 0);
@@ -88,8 +92,8 @@ global {
 				// 1. Quan sát trạng thái môi trường
 				queue_ns <- 0;
 				queue_ew <- 0;
-				loop v over: base_vehicle_species {
-					if (v.current_road != nil and v.speed < 1.0 #km/#h) {
+				loop v over: active_vehicles {
+					if (v.current_road != nil and v.uses_signal and distance_to(v.location,intersection_center) <= detector_distance and v.speed < 1.0 #km/#h) {
 						road r <- road(v.current_road);
 						if (ns_incoming_roads contains r) {
 							queue_ns <- queue_ns + 1;
@@ -152,7 +156,7 @@ global {
 				
 				// Giảm dần tỷ lệ khám phá (Epsilon Decay)
 				if (epsilon > epsilon_min) {
-					epsilon <- epsilon * epsilon_decay;
+					epsilon <- max([epsilon_min, epsilon * epsilon_decay]);
 				}
 				
 				// Lưu lại state và action để học ở bước kế tiếp
@@ -163,148 +167,69 @@ global {
 				// 4. Thực thi Action
 				if (chosen_action = 1) {
 					phase_timer <- 0.0;
-					global_phase <- global_phase + 1; // GREEN -> YELLOW (0->1 hoặc 2->3)
+					global_phase <- global_phase + 1;
 				}
 			}
 		}
-	}
-
-	reflex spawn_traffic_ns when: every(spawn_rate_NS #cycle) {
-		loop start_inter over: [intersection(5), intersection(7)] {
-			if (empty(base_vehicle_species at_distance 7.0 #m where (distance_to(each.location, start_inter.location) < 7.0 #m))) {
-				create base_vehicle_species number: 1 {
-					total_vehicles_created <- total_vehicles_created + 1;
-					bool is_car <- flip(0.4);
-					if (is_car) {
-						vehicle_length <- 4.5 #m;
-						num_lanes_occupied <- 2;
-						max_speed <- (25 + rnd(15)) #km / #h;
-					} else {
-						vehicle_length <- 2.5 #m;
-						num_lanes_occupied <- 1;
-						max_speed <- (20 + rnd(15)) #km / #h;
-					}
-					
-					location <- start_inter.location;
-					intersection target_straight; intersection target_left; intersection target_right;
-					
-					if (start_inter = intersection(5)) {
-						target_straight <- intersection(7); target_right <- intersection(6); target_left <- intersection(4);
-					} else if (start_inter = intersection(7)) {
-						target_straight <- intersection(5); target_right <- intersection(4); target_left <- intersection(6);
-					}
-					
-					intersection chosen_target <- rnd_choice([target_straight :: 0.5, target_left :: 0.25, target_right :: 0.25]);
-					target <- chosen_target;
-					do compute_path graph: road_network target: target;
-					
-					if (chosen_target = target_left) { 
-						current_lane <- is_car ? 4 : rnd(4, 5); 
-						color <- #cyan; 
-					} else if (chosen_target = target_right) { 
-						current_lane <- is_car ? 0 : rnd(0, 1); 
-						color <- #magenta; 
-					} else { 
-						current_lane <- is_car ? 2 : rnd(2, 3); 
-						color <- #lime; 
-					}
-				}
-			}
-		}
-	}
-
-	reflex spawn_traffic_ew when: every(spawn_rate_EW #cycle) {
-		loop start_inter over: [intersection(4), intersection(6)] {
-			if (empty(base_vehicle_species at_distance 7.0 #m where (distance_to(each.location, start_inter.location) < 7.0 #m))) {
-				create base_vehicle_species number: 1 {
-					total_vehicles_created <- total_vehicles_created + 1;
-					bool is_car <- flip(0.4);
-					if (is_car) {
-						vehicle_length <- 4.5 #m;
-						num_lanes_occupied <- 2;
-						max_speed <- (25 + rnd(15)) #km / #h;
-					} else {
-						vehicle_length <- 2.5 #m;
-						num_lanes_occupied <- 1;
-						max_speed <- (20 + rnd(15)) #km / #h;
-					}
-					
-					location <- start_inter.location;
-					intersection target_straight; intersection target_left; intersection target_right;
-					
-					if (start_inter = intersection(4)) {
-						target_straight <- intersection(6); target_right <- intersection(5); target_left <- intersection(7);
-					} else if (start_inter = intersection(6)) {
-						target_straight <- intersection(4); target_right <- intersection(7); target_left <- intersection(5);
-					}
-					
-					intersection chosen_target <- rnd_choice([target_straight :: 0.5, target_left :: 0.25, target_right :: 0.25]);
-					target <- chosen_target;
-					do compute_path graph: road_network target: target;
-					
-					if (chosen_target = target_left) { 
-						current_lane <- is_car ? 4 : rnd(4, 5); 
-						color <- #cyan; 
-					} else if (chosen_target = target_right) { 
-						current_lane <- is_car ? 0 : rnd(0, 1); 
-						color <- #magenta; 
-					} else { 
-						current_lane <- is_car ? 2 : rnd(2, 3); 
-						color <- #lime; 
-					}
-				}
-			}
-		}
-	}
-	
-	reflex update_metrics {
-		int queue <- 0;
-		float sum_wait <- 0.0;
-		float sum_speed <- 0.0;
-		int count <- length(base_vehicle_species);
-		
-		if (count > 0) {
-			loop v over: base_vehicle_species {
-				if (v.speed < 1.0 #km/#h) {
-					queue <- queue + 1;
-				}
-				sum_wait <- sum_wait + v.waiting_time;
-				sum_speed <- sum_speed + v.speed;
-			}
-			average_waiting_time <- sum_wait / count;
-			max_waiting_time <- max(base_vehicle_species collect each.waiting_time);
-			average_speed <- (sum_speed / count) * 3.6;
-			current_queue_length <- queue;
+		if (global_phase mod 2 = 1) {
+			float remaining <- max([0.0, yellow_time - phase_timer]);
+			signal_display_seconds <- int(remaining / (1 #s) + 0.999);
+			signal_countdown <- "" + int(remaining / (1 #s) + 0.999) + "s";
+		} else if (global_phase = 2 or global_phase = 6) {
+			signal_display_seconds <- int(max([0.0, left_green_time - phase_timer]) / (1 #s) + 0.999);
+			signal_countdown <- "" + int(max([0.0, left_green_time - phase_timer]) / (1 #s) + 0.999) + "s";
 		} else {
-			average_waiting_time <- 0.0;
-			max_waiting_time <- 0.0;
-			average_speed <- 0.0;
-			current_queue_length <- 0;
+			signal_display_seconds <- int(max([0.0, max_green_time - phase_timer]) / (1 #s) + 0.999);
+			signal_countdown <- "≤" + int(max([0.0, max_green_time - phase_timer]) / (1 #s) + 0.999) + "s";
 		}
-		
-		if (cycle mod 10 = 0 and cycle > 0) {
-			write "METRIC_CSV," + cycle + "," + total_vehicles_passed + "," + (round(average_waiting_time*100.0)/100.0) + "," + current_queue_length + "," + (round(average_speed*100.0)/100.0) + "," + (round(average_travel_time*100.0)/100.0) + "," + (round(max_waiting_time*100.0)/100.0);
-		}
-		
-		if (cycle mod 50 = 0 and cycle > 0) {
-			write ">> [Q-Learning] Cycle: " + cycle + " | " + phase_names[global_phase] + " (" + (round(phase_timer*10.0)/10.0) + "s) | Action: " + (current_action = 0 ? "EXTEND" : "SWITCH") + " | Eps: " + (round(epsilon*100.0)/100.0) + " | Passed: " + total_vehicles_passed + " | Queue: " + current_queue_length + " | Avg Wait: " + (round(average_waiting_time*10.0)/10.0) + "s | Avg Speed: " + (round(average_speed*10.0)/10.0) + " km/h";
-		}
+	}
+
+	// A1+A4: Spawn and metrics are now centralized in collision_avoidance.gaml
+	// Only verbose logging remains here (specific to Q-Learning)
+	reflex verbose_log when: (cycle mod 50 = 0 and cycle > 0) {
+		write ">> Cycle: " + cycle + " | Phase: " + phase_names[global_phase] + " (" + (round(phase_timer*10.0)/10.0) + "s) | Action: " + (current_action = 0 ? "EXTEND" : "SWITCH") + " | Eps: " + (round(epsilon*100.0)/100.0) + " | Passed: " + total_vehicles_passed + " | Queue: " + current_queue_length + " | TIT: " + (round(total_tit_sum*10.0)/10.0) + "s | Severe TTC: " + severe_conflicts_count + " | PET: " + (round(min_pet_observed*10.0)/10.0) + "s";
 	}
 }
 
 experiment my_experiment type: gui {
-	float minimum_cycle_duration <- 0.05#s;
+	parameter "Xe cầu vượt và hầm" var: enable_bypass_traffic;
+	parameter "Xem mặt cắt hầm" var: show_tunnel_cutaway;
+	float minimum_cycle_duration <- 0.05#s; // Up to 2 model seconds per wall second (step = 0.1 s)
 	output {
-		display intersection_view background: #black {
+		monitor "Xe hoàn thành mặt đất" value: total_vehicles_passed;
+		monitor "Xe hoàn thành cầu vượt/hầm" value: bypass_vehicles_passed;
+		monitor "Hàng đợi mặt đất" value: current_queue_length;
+		monitor "Pha đèn" value: phase_names[global_phase];
+		monitor "Đếm ngược pha" value: signal_countdown;
+		monitor "Chờ trung bình (s)" value: average_waiting_time;
+		display doan_3d type: opengl background: rgb(8,12,22) {
+			camera 'default' location: {820,1210,220} target: {1000,1000,16};
+			species doan_ground aspect: base;
+			species bridge_pillar;
+			species metro_pillar;
+			species tunnel_structure;
+			species flyover_structure;
+			species metro_structure;
+			species traffic_signal_post aspect: doan_3d;
+			species base_vehicle_species aspect: doan_3d;
+			species doan_metro aspect: base;
+		}
+
+		display intersection_view background: rgb(18, 22, 28) {
+			species doan_ground aspect: base;
 			species road aspect: base;
+			species traffic_signal_post aspect: base;
+			species conflict_zone aspect: base;
 			species base_vehicle_species aspect: base;
-			species intersection aspect: base;
 			graphics "HUD" {
-				draw "Q-LEARNING AI CONTROLLER" at: {20, 15} color: #cyan font: font("Helvetica", 14, #bold);
-				draw "Phase: " + phase_names[global_phase] + " (" + int(phase_timer) + "s)" at: {20, 35} color: (global_phase = 0 or global_phase = 2 ? #lime : (global_phase = 1 or global_phase = 3 ? #yellow : #red)) font: font("Helvetica", 16, #bold);
-				draw "Action: " + (current_action = 0 ? "EXTEND (0)" : "SWITCH (1)") + " | Epsilon: " + (round(epsilon*100.0)/100.0) at: {20, 55} color: #cyan font: font("Helvetica", 13, #plain);
-				draw "Queue NS: " + queue_ns + " | EW: " + queue_ew + " | Q-Updates: " + q_updates_count at: {20, 75} color: #orange font: font("Helvetica", 13, #plain);
-				draw "Passed: " + total_vehicles_passed + " | Active: " + length(base_vehicle_species) + " | Queue: " + current_queue_length at: {20, 95} color: #white font: font("Helvetica", 13, #plain);
+				rgb phase_c <- global_phase mod 2 = 0 ? #lime : #yellow;
+				draw rectangle(310, 115) at: {165, 62} color: rgb(15, 23, 42, 215) border: rgb(71, 85, 105);
+				draw "TRAFFIC-LIGHT ABM | Q-LEARNING" at: {20, 22} color: #cyan font: font("Helvetica", 13, #bold);
+				draw circle(4.5) at: {26, 42} color: phase_c;
+				draw "Phase: " + phase_names[global_phase] + " (" + int(phase_timer) + "s)" at: {38, 45} color: phase_c font: font("Helvetica", 14, #bold);
+				draw "Action: " + (current_action = 0 ? "EXTEND" : "SWITCH") + " | Eps: " + (round(epsilon*100.0)/100.0) + " | Q-Up: " + q_updates_count at: {20, 68} color: #cyan font: font("Helvetica", 12, #plain);
+				draw "Passed: " + total_vehicles_passed + " xe | Queue: " + current_queue_length + " | Avg Wait: " + (round(average_waiting_time*10.0)/10.0) + "s" at: {20, 88} color: rgb(226, 232, 240) font: font("Helvetica", 12, #plain);
+				draw "TIT: " + (round(total_tit_sum*10.0)/10.0) + "s | TTC<1s: " + severe_conflicts_count + " | HardBrakes: " + hard_braking_count + " | PET: " + (round(min_pet_observed*10.0)/10.0) + "s" at: {20, 108} color: rgb(248, 113, 113) font: font("Helvetica", 11, #plain);
 			}
 		}
 		display performance_charts {
@@ -318,7 +243,7 @@ experiment my_experiment type: gui {
 	}
 }
 
-experiment my_batch_experiment type: batch until: (cycle >= 2000) {
+experiment my_batch_experiment type: batch until: (cycle >= doan_horizon_cycles) {
 	// Seed giam de 4 thuat toan (Fixed-Time/MaxPressure/Q-Learning/DQN) chay
 	// cung luong yeu cau xe -> so sanh cong bang & kha lap lai
 	parameter "Seed" var: seed init: 5001.0;

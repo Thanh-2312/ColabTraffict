@@ -21,6 +21,7 @@ Protocol chi tiet xem header cua Traffic/models/intersection-dqn-python.gaml
 ==============================================================================
 """
 
+import asyncio
 import json
 import os
 
@@ -78,7 +79,7 @@ class GamaTrafficEnv:
 
     Cach dung (ben trong asyncio.run):
         env = GamaTrafficEnv(port=6868)
-        await env.setup()          # ket noi + load experiment
+        await env.setup()          # ket noi; reset se load experiment
         state = await env.reset(seed=42)
         next_state, reward, done, info = await env.step(action)
         await env.close()
@@ -110,7 +111,7 @@ class GamaTrafficEnv:
 
     # ------------------------------------------------------------ lifecycle
     async def setup(self):
-        """Ket noi WebSocket + load experiment (lay exp_id)."""
+        """Connect to gama-server; first reset loads the seeded experiment."""
         self.client = GamaSyncClient(
             self.host, self.port,
             other_message_handler=self._on_server_message,
@@ -119,27 +120,46 @@ class GamaTrafficEnv:
         await self.client.connect_awaitable()
         if self.verbose:
             print(f"[GamaEnv] Da ket noi ws://{self.host}:{self.port}")
-        await self.load_experiment()
+        # The first reset will load the model with its episode seed. Loading
+        # here and immediately reloading it races GAMA's simulation startup.
 
-    async def load_experiment(self):
+    async def load_experiment(self, parameters=None):
         resp = await self.client.load_awaitable(
             self.model_path, self.experiment,
             console=False, status=False, dialog=False, runtime=True,
+            parameters=parameters,
             timeout=self.timeout,
         )
         rtype = resp.get("type", "")
         if rtype != "CommandExecutedSuccessfully":
             raise GamaEnvError(f"Loi load experiment: {resp}")
         self.exp_id = resp.get("content")
+        # gama-server may start the newly loaded GUI experiment immediately.
+        # Pause before the first reload/step so its worker cannot mutate the
+        # vehicle population while a new simulation is being initialized.
+        await self.pause()
         if self.verbose:
             print(f"[GamaEnv] Da load '{self.experiment}' -> exp_id={self.exp_id}")
         return self.exp_id
 
     async def close(self):
         try:
-            self.client.close_connection()
-        except Exception:
-            pass
+            if self.client is not None and self.exp_id is not None:
+                await self.pause()
+                # Let the simulation worker finish its current reflex before
+                # disconnecting. Stopping a just-paused experiment can clear
+                # its agent scope while the traffic driving skill is running.
+                await asyncio.sleep(0.5)
+        finally:
+            if self.client is not None:
+                self.client.close_connection()
+                self.client = None
+            self.exp_id = None
+
+    async def pause(self):
+        resp = await self.client.pause_awaitable(self.exp_id, timeout=self.timeout)
+        if resp.get("type") != "CommandExecutedSuccessfully":
+            raise GamaEnvError(f"Could not pause GAMA experiment: {resp}")
 
     # ------------------------------------------------------------ primitives
     async def _exec_expression(self, expr):
@@ -193,32 +213,47 @@ class GamaTrafficEnv:
             raise GamaEnvError(f"ask set_dqn_action failed: {resp}")
 
     async def step_cycles(self, n):
-        """Chay dung n cycle mo phong (dong bo - sync=True)."""
-        n = max(1, int(n))
-        await self.client.step_awaitable(self.exp_id, n, sync=True,
-                                         timeout=self.timeout)
+        """Run n cycles in short synchronous batches and check each response."""
+        remaining = int(n)
+        if remaining < 0:
+            raise ValueError(f"Cycle count must be non-negative: {n}")
+        while remaining:
+            chunk = min(10, remaining)
+            resp = await self.client.step_awaitable(
+                self.exp_id, chunk, sync=True, timeout=self.timeout)
+            if resp.get("type") != "CommandExecutedSuccessfully":
+                raise GamaEnvError(f"GAMA step failed: {resp}")
+            remaining -= chunk
 
     async def get_next_decision_in(self):
         return int(float(await self._exec_expression("next_decision_in_cycles")))
 
     # -------------------------------------------------------------- gym API
-    async def reset(self, seed=None):
-        """Reset mo phong (reload experiment), truyen seed neu co.
+    async def reset(self, seed=None, parameters=None):
+        """Load the first seeded episode, then reload for later episodes.
 
         Luu y: tham so dac biet "seed" cua gama-server reload bi bo qua
         (cac episode trung lap) -> phai truyen qua tham so thuong "rng_seed"
         (model se gan seed <- rng_seed trong init, truoc khi sinh xe).
         """
-        params = None
+        params = list(parameters or [])
         if seed is not None:
-            params = [{"type": "float", "value": str(float(int(seed))),
-                       "name": "rng_seed"}]
-        resp = await self.client.reload_awaitable(self.exp_id, parameters=params,
-                                                  timeout=self.timeout)
-        rtype = resp.get("type", "")
-        if rtype != "CommandExecutedSuccessfully":
-            raise GamaEnvError(f"Loi reload experiment (seed={seed}): {resp}")
-        return await self.read_state()
+            params.append({"type": "float", "value": str(float(int(seed))),
+                           "name": "rng_seed"})
+        if self.exp_id is None:
+            await self.load_experiment(parameters=params)
+        else:
+            await self.pause()
+            await asyncio.sleep(0.2)
+            resp = await self.client.reload_awaitable(
+                self.exp_id, parameters=params, timeout=self.timeout)
+            if resp.get("type") != "CommandExecutedSuccessfully":
+                raise GamaEnvError(f"Loi reload experiment (seed={seed}): {resp}")
+            await self.pause()
+        state = await self.read_state()
+        if state["cycle"] != 0:
+            raise GamaEnvError(f"Reset did not start at cycle 0: {state['cycle']}")
+        return state
 
     async def step(self, action):
         """
@@ -226,16 +261,34 @@ class GamaTrafficEnv:
         Tra ve (next_state, reward, done=False, info).
         Horizon episode do train.py/evaluate.py tu quan ly qua state['cycle'].
         """
+        current_state = await self.read_state()
+        if not current_state["dqn_waiting_action"]:
+            raise GamaEnvError(
+                f"DQN action sent outside a decision tick (cycle={current_state['cycle']})"
+            )
         await self.set_action(action)
         await self.step_cycles(1)                      # handshake: GAMA ap dung action
         nb = await self.get_next_decision_in()
+        if nb <= 0:
+            raise GamaEnvError(f"Invalid next decision interval: {nb}")
         await self.step_cycles(nb)                     # chay den tick quyet dinh ke tiep
         next_state = await self.read_state()
+        # Yellow may stay active until vehicles already inside the junction clear.
+        # Advance to an actual decision tick instead of returning an intermediate state.
+        advanced = nb + 1
+        while not next_state["dqn_waiting_action"]:
+            if advanced >= 1200:
+                raise GamaEnvError("No DQN decision within 1200 cycles after action")
+            more = max(1, int(next_state["next_decision_in_cycles"]))
+            more = min(more, 1200 - advanced)
+            await self.step_cycles(more)
+            advanced += more
+            next_state = await self.read_state()
 
         # Reward giong Q-learning tabular: -tong queue; co the them trong so wait
         reward = -(self.w_queue * next_state["current_queue_length"]
                    + self.w_wait * next_state["average_waiting_time"])
-        info = {"next_decision_in_cycles": nb}
+        info = {"next_decision_in_cycles": advanced - 1}
         return next_state, reward, False, info
 
 
@@ -258,5 +311,5 @@ def featurize(state):
         min(1.0, state["green_cycles"] / MAX_GREEN_CYCLES),
         1.0 if state["green_cycles"] >= MIN_GREEN_CYCLES else 0.0,
         1.0 if state["global_phase"] == 0 else 0.0,
-        1.0 if state["global_phase"] == 2 else 0.0,
+        1.0 if state["global_phase"] == 4 else 0.0,
     ], dtype="float32")

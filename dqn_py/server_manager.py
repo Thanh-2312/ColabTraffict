@@ -16,8 +16,11 @@ import signal
 import socket
 import subprocess
 import time
+from collections import deque
 
-GAMA_HEADLESS = "/Applications/Gama.app/Contents/headless/gama-headless.sh"
+GAMA_HEADLESS = os.environ.get(
+    "GAMA_HEADLESS", "/Applications/Gama.app/Contents/headless/gama-headless.sh"
+)
 BASE_DIR = os.path.dirname(os.path.abspath(__file__))
 RUN_DIR = os.path.join(BASE_DIR, "run")
 
@@ -53,7 +56,7 @@ class GamaServerManager:
     def _tail_log(self, n=25):
         try:
             with open(self.log_file, "r", errors="replace") as f:
-                return "".join(f.readlines()[-n:])
+                return "".join(deque(f, maxlen=n))
         except OSError:
             return "(khong doc duoc log)"
 
@@ -76,7 +79,7 @@ class GamaServerManager:
         print(f"[GamaServer] Dang khoi dong: {' '.join(cmd)}  (workdir={self.workdir})")
         print(f"[GamaServer] Log: {self.log_file}  (khoi dong GAMA mat ~30-90s)")
         self.process = subprocess.Popen(
-            cmd, cwd=self.workdir, stdout=self._log_fh, stderr=subprocess.STDOUT,
+            cmd, cwd=self.workdir, stdout=self._log_fh, stderr=subprocess.STDOUT, start_new_session=True,
         )
 
         t0 = time.time()
@@ -101,18 +104,37 @@ class GamaServerManager:
     # ------------------------------------------------------------------ stop
     def stop(self, force=False):
         """Dung gama-server (terminate, roi kill neu can)."""
-        if self.process is None:
-            return
-        if self.process.poll() is None:
+        if self.process is not None:
+            # gama-headless.sh launches a JVM child. Terminating only bash leaves
+            # that JVM listening with cached GAML. Signal our isolated group.
             try:
-                self.process.send_signal(signal.SIGKILL if force else signal.SIGTERM)
-                self.process.wait(timeout=15)
-            except subprocess.TimeoutExpired:
-                self.process.kill()
-                self.process.wait(timeout=10)
+                os.killpg(self.process.pid, signal.SIGKILL if force else signal.SIGTERM)
             except ProcessLookupError:
                 pass
-        print("[GamaServer] Da dung gama-server.")
+            except PermissionError:
+                # macOS may report EPERM for a vanished process group. Only
+                # accept that case after checking both launcher and listener.
+                if self.process.poll() is None or self.is_port_open(timeout=.1):
+                    raise
+            deadline = time.monotonic() + (2 if force else 15)
+            while time.monotonic() < deadline:
+                # The shell can exit before the JVM finishes its shutdown
+                # hooks. A process-group probe is not proof the port is free.
+                if self.process.poll() is not None and not self.is_port_open(timeout=.1):
+                    break
+                time.sleep(0.1)
+            else:
+                try:
+                    os.killpg(self.process.pid, signal.SIGKILL)
+                except ProcessLookupError:
+                    pass
+            self.process.wait(timeout=10)
+            deadline = time.monotonic() + 10
+            while self.is_port_open(timeout=.1):
+                if time.monotonic() >= deadline:
+                    raise GamaServerError(f"Cong {self.port} van mo sau khi dung server da tao.")
+                time.sleep(.1)
+            print("[GamaServer] Da dung gama-server.")
         if self._log_fh:
             self._log_fh.close()
             self._log_fh = None
