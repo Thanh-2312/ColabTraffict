@@ -194,8 +194,8 @@ global {
 experiment my_experiment type: gui {
 	parameter "Xe cầu vượt và hầm" var: enable_bypass_traffic;
 	parameter "Xem mặt cắt hầm" var: show_tunnel_cutaway;
-	float minimum_cycle_duration <- 0.05#s; // Up to 2 model seconds per wall second (step = 0.1 s)
-	output {
+	float minimum_cycle_duration <- 0.033#s; // About 3 model seconds per wall second (step = 0.1 s)
+	output synchronized: true {
 		monitor "Xe hoàn thành mặt đất" value: total_vehicles_passed;
 		monitor "Xe hoàn thành cầu vượt/hầm" value: bypass_vehicles_passed;
 		monitor "Hàng đợi mặt đất" value: current_queue_length;

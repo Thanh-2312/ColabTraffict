@@ -19,16 +19,9 @@ global {
 		global_counter <- (round(global_counter / step) + 1) * step;
 		phase_timer <- global_counter;
 		if (global_counter >= phase_durations[global_phase]) {
-			// The nominal yellow has ended. Keep every approach red until
-			// vehicles admitted by the old phase have left the junction.
-			if (global_phase mod 2 = 0 or junction_clear()) {
-				global_counter <- 0.0;
-				phase_timer <- 0.0;
-				global_phase <- (global_phase + 1) mod length(phase_durations);
-			} else {
-				global_counter <- phase_durations[global_phase];
-				phase_timer <- global_counter;
-			}
+			global_counter <- 0.0;
+			phase_timer <- 0.0;
+			global_phase <- (global_phase + 1) mod length(phase_durations);
 		}
 		float remaining <- max([0.0, phase_durations[global_phase] - global_counter]);
 		signal_display_seconds <- int(remaining / (1 #s) + 0.999);
@@ -46,8 +39,8 @@ global {
 experiment my_experiment type: gui {
 	parameter "Xe cầu vượt và hầm" var: enable_bypass_traffic;
 	parameter "Xem mặt cắt hầm" var: show_tunnel_cutaway;
-	float minimum_cycle_duration <- 0.05#s; // Up to 2 model seconds per wall second (step = 0.1 s)
-	output {
+	float minimum_cycle_duration <- 0.033#s; // About 3 model seconds per wall second (step = 0.1 s)
+	output synchronized: true {
 		monitor "Xe hoàn thành mặt đất" value: total_vehicles_passed;
 		monitor "Xe hoàn thành cầu vượt/hầm" value: bypass_vehicles_passed;
 		monitor "Hàng đợi mặt đất" value: current_queue_length;

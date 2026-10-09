@@ -257,7 +257,7 @@ global {
 
 	// Global Traffic Light state variables shared by all controllers.
 	// Display text is set by each controller after its phase decision.
-	// Adaptive greens show an upper bound; yellow may wait for the junction.
+	// Adaptive greens show an upper bound; all yellow phases last 3 model seconds.
 	string signal_countdown <- "";
 
 	// Each axis has a protected through phase and a separate protected left phase.
@@ -341,7 +341,7 @@ global {
 		dilemma_zone_vehicles_count <- 0;
 	}
 
-	// Chỉ cấp xanh cho hướng kế tiếp sau khi xe của pha cũ rời đoạn đường trong nút giao.
+	// Kiểm tra xe còn trên đoạn đường trong nút giao (dùng bởi kiểm thử tích hợp).
 	bool junction_clear {
 		return empty(active_vehicles where (
 			each.current_road != nil and road(each.current_road).is_signal_connector and
