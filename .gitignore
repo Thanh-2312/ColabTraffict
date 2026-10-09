@@ -17,6 +17,7 @@ __pycache__/
 .cache/
 .built_in_models_*
 .gama_application_workspace
+Traffic/models/snapshots/
 tmp_ws/
 **/server_ws/
 test_vehicle_behavior_batch/
@@ -30,26 +31,10 @@ dqn_py/run/
 *.bak
 Traffic/models/tmp_*.gaml
 
-# LaTeX build intermediate files
-*.aux
-*.out
-*.toc
-*.fls
-*.fdb_latexmk
-*.synctex.gz
-*.nav
-*.snm
-seminar/preview/
-seminar/original/
-seminar/previous_version/
-seminar/speaker_notes.tex
-seminar/figures/*.png
-seminar/figures/data_summary.json
-seminar/figures/test_queue.pdf
-seminar/figures/test_seeds.pdf
-seminar/quality_check.json
-seminar/slide_manifest.json
-seminar/*_generated.*
+# Local presentation material and research papers
+seminar/
+/*.pdf
+Traffic_Papers/
 
 # macOS system files
 .DS_Store
@@ -57,6 +42,3 @@ seminar/*_generated.*
 ._*
 .Spotlight-V100
 .Trashes
-
-# Large research papers repository (~1.9GB)
-Traffic_Papers/
