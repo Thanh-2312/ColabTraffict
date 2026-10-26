@@ -1,6 +1,6 @@
 /** Shared signal schedule and replayed demand for all four Python policies. */
 model intersection_benchmark
-import "intersection-dqn-python.gaml"
+import "intersection-dqn-legacy.gaml"
 
 global {
 	int through_queue_ns <- 0;

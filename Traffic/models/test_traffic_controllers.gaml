@@ -192,6 +192,27 @@ global {
 	}
 
 	// Edge Case 1: Spawn Clearance Assertion
+	reflex test_following_ttc when: cycle = 15 {
+		list<base_vehicle_species> probes <- [];
+		create base_vehicle_species number: 2 {
+			probes <- probes + self;
+			vehicle_length <- 4.0; vehicle_width <- 1.9; heading <- 0.0;
+		}
+		base_vehicle_species a <- probes[0]; base_vehicle_species b <- probes[1];
+		ask a { location <- {0,0}; speed <- 10.0; }
+		ask b { location <- {8,0}; speed <- 5.0; }
+		float first_ttc <- a.following_ttc(b);
+		ask a { location <- {8,0}; speed <- 5.0; }
+		ask b { location <- {0,0}; speed <- 10.0; }
+		float renamed_ttc <- b.following_ttc(a);
+		ask a { location <- {8,4}; }
+		do log_assertion("Safety", "TTC-NameIndependent", abs(first_ttc - 0.8) < 0.0001 and
+			abs(renamed_ttc - first_ttc) < 0.0001, "Same following geometry gives the same TTC for either agent ordering");
+		do log_assertion("Safety", "TTC-SeparateLanes", b.following_ttc(a) = 99.0,
+			"Passing on a separate parallel lane is not a rear-end TTC conflict");
+	}
+
+	// Edge Case 1: Spawn Clearance Assertion
 	bool spawn_clearance_ok <- true;
 	reflex test_edge_spawn_clearance when: cycle < 300 and cycle mod 10 = 0 {
 		// TARGET nodes contain finished agents. Check live vehicles at their

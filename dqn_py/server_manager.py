@@ -75,7 +75,11 @@ class GamaServerManager:
 
         os.makedirs(self.workdir, exist_ok=True)
         self._log_fh = open(self.log_file, "w")
-        cmd = ["bash", self.gama_headless, "-socket", str(self.port)]
+        configuration = os.path.join(self.workdir, "configuration")
+        workspace = os.path.join(self.workdir, "workspace")
+        os.makedirs(workspace, exist_ok=True)
+        cmd = ["bash", self.gama_headless, "-socket", str(self.port),
+               "-configuration", configuration, "-data", workspace]
         print(f"[GamaServer] Dang khoi dong: {' '.join(cmd)}  (workdir={self.workdir})")
         print(f"[GamaServer] Log: {self.log_file}  (khoi dong GAMA mat ~30-90s)")
         self.process = subprocess.Popen(

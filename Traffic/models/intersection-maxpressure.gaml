@@ -49,7 +49,7 @@ global {
 		
 		// Yellow phases clear the intersection before the next movement opens.
 		if (global_phase mod 2 = 1) {
-			if (phase_timer >= yellow_time) {
+			if (phase_timer >= yellow_time + 2 #s and signal_junction_clear()) {
 				phase_timer <- 0.0;
 				global_phase <- (global_phase + 1) mod 8;
 			}

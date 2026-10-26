@@ -30,12 +30,6 @@ def run_test_suite():
     print("🧪 BẮT ĐẦU CHẠY BỘ TEST SUITE: UNIT TESTS & EDGE CASES KIỂM CHỨNG GAMA")
     print("=" * 90)
     
-    cmd = [
-        "bash", GAMA_HEADLESS,
-        "-batch", "my_batch_experiment",
-        TEST_MODEL
-    ]
-    
     start_time = time.time()
     test_results = []
     recent_output = deque(maxlen=25)
@@ -43,9 +37,15 @@ def run_test_suite():
     
     print("\n🚀 Đang thực thi mô phỏng và thu thập các assertions...\n")
     with tempfile.TemporaryDirectory(prefix="gama_controller_suite_") as work:
+        configuration = os.path.join(work, "configuration")
+        os.makedirs(configuration, exist_ok=True)
+        cmd = ["bash", GAMA_HEADLESS, "-configuration", configuration,
+               "-batch", "my_batch_experiment", TEST_MODEL]
         with subprocess.Popen(
             cmd, cwd=work, stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
-            text=True, bufsize=1
+            text=True, bufsize=1,
+            env={**os.environ, '_JAVA_OPTIONS': os.environ.get('_JAVA_OPTIONS', '') +
+                 ' -Xms256m -Xmx2g -XX:-AlwaysPreTouch'}
         ) as process:
             for line in process.stdout:
                 recent_output.append(line.rstrip())

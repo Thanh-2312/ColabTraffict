@@ -10,6 +10,11 @@ __pycache__/
 *.py[cod]
 *$py.class
 *.so
+*.aux
+*.out
+*.toc
+*.nav
+*.snm
 
 # GAMA & Eclipse workspace artifacts
 .metadata/

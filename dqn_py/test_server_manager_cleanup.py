@@ -14,7 +14,10 @@ from dqn_py.server_manager import GamaServerManager
 class ServerCleanupTest(unittest.TestCase):
     def test_stop_releases_child_port(self):
         with socket.socket() as probe:
-            probe.bind(('127.0.0.1', 0))
+            try:
+                probe.bind(('127.0.0.1', 0))
+            except PermissionError as error:
+                self.skipTest(f'local socket binding is unavailable: {error}')
             port = probe.getsockname()[1]
         with tempfile.TemporaryDirectory() as tmp:
             root = Path(tmp)

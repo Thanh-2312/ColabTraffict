@@ -39,6 +39,7 @@ global {
 	int audit_prev_phase <- -1;
 	int audit_phase_start <- 0;
 	int audit_phase_changes <- 0;
+	bool audit_direct_phase <- false;
 	map<string, road> audit_last_road <- [];
 	map<string, int> audit_last_lane <- [];
 	map<string, point> audit_last_position <- [];
@@ -168,9 +169,15 @@ global {
 		}
 		if (audit_prev_phase >= 0 and global_phase != audit_prev_phase) {
 			int phase_ticks <- cycle - audit_phase_start;
-			if (global_phase != (audit_prev_phase + 1) mod 8 or
-					(audit_prev_phase mod 2 = 1 and phase_ticks < 29) or
-				(audit_prev_phase mod 2 = 0 and (phase_ticks < 99 or phase_ticks > 601))) {
+			bool invalid_phase <- audit_direct_phase ?
+				(audit_prev_phase mod 2 = 0 ?
+					global_phase != (audit_prev_phase + 1) mod 8 : global_phase mod 2 != 0) :
+				global_phase != (audit_prev_phase + 1) mod 8;
+			bool invalid_duration <- audit_direct_phase ?
+				(audit_prev_phase mod 2 = 1 ? phase_ticks < 49 : phase_ticks < 99) :
+				(audit_prev_phase mod 2 = 1 ? phase_ticks < 49 :
+					(phase_ticks < 99 or phase_ticks > 601));
+			if (invalid_phase or invalid_duration) {
 				audit_phase_errors <- audit_phase_errors + 1;
 			}
 			audit_phase_changes <- audit_phase_changes + 1;
@@ -180,14 +187,6 @@ global {
 		loop v over: active_vehicles {
 			if (v.current_road != nil and v.final_target != nil) {
 				road r <- road(v.current_road); string k <- v.name;
-				if (k = "base_vehicle_species94" and cycle >= 2030 and cycle <= 2075) {
-					write "DOAN_BRAKE_TRACE," + cycle + "," + r.road_key + "," +
-						v.distance_to_current_target + "," + v.measured_speed + "," +
-						v.speed + "," + v.max_speed + "," + v.current_acc + "," +
-						v.proba_respect_priorities + "," + v.proba_block_node + "," +
-						(v.current_target = nil ? "" : intersection(v.current_target).node_key) + "," +
-						(v.next_road = nil ? "" : road(v.next_road).road_key) + "," + v.blocked;
-				}
 				if (v.current_acc < audit_min_acc and v.current_acc < -12) {
 					write "DOAN_BRAKE," + cycle + "," + k + "," + v.route_kind + "," + r.road_key + "," + v.current_acc + "," + v.speed + "," + v.distance_to_current_target + "," + v.maneuver + "," + v.lowest_lane + "," + v.max_speed;
 					loop w over: v.nearby_vehicles(50 #m) where (each != v and
@@ -234,8 +233,14 @@ global {
 					}
 					if (r.is_signal_connector) {
 						bool valid <- v.maneuver = "left" ?
-							((v.approach_ns and (global_phase = 2 or global_phase = 3)) or (!v.approach_ns and (global_phase = 6 or global_phase = 7))) :
-							((v.approach_ns and (global_phase = 0 or global_phase = 1)) or (!v.approach_ns and (global_phase = 4 or global_phase = 5)));
+							((v.approach_ns and (global_phase = 2 or
+								(global_phase = 3 and phase_timer < signal_yellow_seconds))) or
+							 (!v.approach_ns and (global_phase = 6 or
+								(global_phase = 7 and phase_timer < signal_yellow_seconds)))) :
+							((v.approach_ns and (global_phase = 0 or
+								(global_phase = 1 and phase_timer < signal_yellow_seconds))) or
+							 (!v.approach_ns and (global_phase = 4 or
+								(global_phase = 5 and phase_timer < signal_yellow_seconds))));
 						if ((!valid and !v.yellow_commit) or
 							(v.maneuver = "left" and !v.left_committed)) {
 							audit_red_entries <- audit_red_entries + 1;

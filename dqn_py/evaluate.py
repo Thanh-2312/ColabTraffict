@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """
 ==============================================================================
-EVALUATE DQN - Danh gia chinh sach da hoc (epsilon = 0, greedy policy)
+EVALUATE 3DQN - Danh gia chinh sach da hoc (epsilon = 0, greedy policy)
 ==============================================================================
 Chay N episode voi weights da train, moi 10 cycle doc metrics 1 lan
 (giong hang "METRIC_CSV" cua 3 model kia) va xuat CSV cung schema voi
@@ -24,7 +24,7 @@ import csv
 import os
 import time
 
-from dqn_agent import DQNAgent
+from three_dqn_agent import ThreeDQNAgent
 from gama_env import GamaTrafficEnv, featurize
 from server_manager import GamaServerManager
 
@@ -48,6 +48,36 @@ def write_sample(writer, state, episode, horizon):
     return True
 
 
+async def evaluate_episode(env, agent, seed, horizon, writer, episode):
+    state = await env.reset(seed=seed)
+    pending = None
+    reward = 0.0
+    decisions = rows = 0
+    while state["cycle"] < horizon:
+        if state["dqn_waiting_action"]:
+            if pending is not None:
+                reward += env.transition_reward(pending, state)
+            action = agent.act(featurize(state), greedy=True, action_mask=state["action_mask"])
+            pending = state
+            await env.set_action(action)
+            await env.step_cycles(1)
+            decisions += 1
+        else:
+            count = min(state["next_decision_in_cycles"], 10 - state["cycle"] % 10,
+                        horizon - state["cycle"])
+            if count <= 0:
+                raise RuntimeError("Invalid DQN evaluation schedule")
+            await env.step_cycles(count)
+        # Always use GAMA's current schedule, including extensions of all-red.
+        state = await env.read_state()
+        rows += int(write_sample(writer, state, episode, horizon))
+    if pending is not None:
+        if "dtse" not in state:
+            state = await env.read_state(force_dtse=True)
+        reward += env.transition_reward(pending, state)
+    return state, reward, decisions, rows
+
+
 def parse_args():
     p = argparse.ArgumentParser(description="Evaluate trained DQN traffic controller")
     p.add_argument("--weights", type=str, required=True,
@@ -60,10 +90,6 @@ def parse_args():
     p.add_argument("--host", type=str, default="localhost")
     p.add_argument("--start-server", action="store_true")
     p.add_argument("--keep-server", action="store_true")
-    p.add_argument("--hidden", type=int, nargs="+", default=[32, 32],
-                   help="Phai khop kich thuoc mang khi train")
-    p.add_argument("--w-queue", type=float, default=1.0)
-    p.add_argument("--w-wait", type=float, default=0.0)
     p.add_argument("--experiment", type=str, default="dqn_server_experiment",
                    help="Ten experiment trong file GAML")
     p.add_argument("--output", type=str,
@@ -71,8 +97,7 @@ def parse_args():
     return p.parse_args()
 
 
-async def amain():
-    args = parse_args()
+async def amain(args):
 
     manager = GamaServerManager(port=args.port) if args.start_server else None
     env = None
@@ -80,11 +105,11 @@ async def amain():
         if manager is not None:
             manager.start()
         env = GamaTrafficEnv(host=args.host, port=args.port,
-                             experiment=args.experiment,
-                             w_queue=args.w_queue, w_wait=args.w_wait)
+                             experiment=args.experiment)
         await env.setup()
-        agent = DQNAgent(hidden_dims=tuple(args.hidden))
+        agent = ThreeDQNAgent(buffer_size=1, warmup=1)
         agent.load(args.weights)
+        env.reward_mode = agent.reward_mode
         agent.eps = 0.0
         print(f"[Eval] Da load weights: {args.weights} | policy = GREEDY (eps=0)")
 
@@ -98,40 +123,10 @@ async def amain():
 
             for ep in range(1, args.episodes + 1):
                 seed = args.seed_base + ep
-                state = await env.reset(seed=seed)
-                ep_reward = 0.0
-                decisions = 0
                 t0 = time.time()
-
-                nb = state["next_decision_in_cycles"]
-                while state["cycle"] < args.episode_horizon:
-                    if state["dqn_waiting_action"]:
-                        if decisions > 0:
-                            # State hien tai = trang thai tai quyet dinh ke tiep
-                            # -> reward cua buoc truoc (giong logic trong train)
-                            ep_reward += -(args.w_queue * state["current_queue_length"]
-                                           + args.w_wait * state["average_waiting_time"])
-                        action = agent.act(featurize(state), greedy=True)
-                        await env.set_action(action)
-                        await env.step_cycles(1)             # handshake
-                        nb = await env.get_next_decision_in()
-                        decisions += 1
-                        state = await env.read_state()
-                        if write_sample(writer, state, ep, args.episode_horizon):
-                            n_rows += 1
-                    # Match GAMA's METRIC_CSV sampling grid exactly: cycles
-                    # 10, 20, ..., horizon-10. Handshake cycles must not
-                    # shift the sampling grid or extend the episode.
-                    until_sample = 10 - state["cycle"] % 10
-                    chunk = min(nb, until_sample,
-                                args.episode_horizon - state["cycle"])
-                    if chunk <= 0:
-                        raise RuntimeError("Invalid DQN evaluation schedule")
-                    await env.step_cycles(chunk)
-                    nb -= chunk
-                    state = await env.read_state()
-                    if write_sample(writer, state, ep, args.episode_horizon):
-                        n_rows += 1
+                state, ep_reward, decisions, count = await evaluate_episode(
+                    env, agent, seed, args.episode_horizon, writer, ep)
+                n_rows += count
 
                 print(f"[Eval] Ep {ep} | seed={seed} | reward={ep_reward:.1f} "
                       f"| decisions={decisions} | passed={state['total_vehicles_passed']} "
@@ -154,4 +149,4 @@ async def amain():
 
 
 if __name__ == "__main__":
-    asyncio.run(amain())
+    asyncio.run(amain(parse_args()))

@@ -341,7 +341,17 @@ global {
 		dilemma_zone_vehicles_count <- 0;
 	}
 
-	// Kiểm tra xe còn trên đoạn đường trong nút giao (dùng bởi kiểm thử tích hợp).
+		// Shared clearance rule for every controller on this geometry.
+		bool signal_junction_clear {
+			return empty(active_vehicles where (each.current_road != nil and each.uses_signal and
+				(road(each.current_road).is_signal_connector or
+				 (road(each.current_road).is_incoming and each.yellow_commit and
+				  each.distance_to_current_target <= signal_node_to_stop_bar + each.vehicle_length / 2.0 + stop_bar_clearance) or
+				 (!road(each.current_road).is_incoming and distance_to(each.location, intersection_center) <=
+				  distance_to_intersection_center + each.vehicle_length / 2.0 + 5.0 #m))));
+		}
+
+		// Kiểm tra xe còn trên đoạn đường trong nút giao (dùng bởi kiểm thử tích hợp).
 	bool junction_clear {
 		return empty(active_vehicles where (
 			each.current_road != nil and road(each.current_road).is_signal_connector and
@@ -907,6 +917,24 @@ species base_vehicle_species skills: [driving] parallel: false {
 	float current_acc <- 0.0;
 	bool is_in_dz <- false;
 	float min_ttc_experienced <- 99.0;
+	bool was_hard_braking <- false;
+	bool was_panic_braking <- false;
+	list<base_vehicle_species> previous_severe_partners <- [];
+
+	// Rear-end TTC is directional: the follower observes the leader. Filtering
+	// by agent names first discards real conflicts. Crossing conflicts use PET.
+	float following_ttc(base_vehicle_species leader) {
+		float direction_diff <- abs(heading - leader.heading);
+		if (direction_diff > 180.0) { direction_diff <- 360.0 - direction_diff; }
+		point delta <- leader.location - location;
+		float along <- delta.x * cos(heading) + delta.y * sin(heading);
+		float lateral <- abs(delta.x * sin(heading) - delta.y * cos(heading));
+		float gap <- along - (vehicle_length + leader.vehicle_length) / 2.0;
+		float closing <- speed - leader.speed * cos(direction_diff);
+		if (direction_diff > 30.0 or lateral >= (vehicle_width + leader.vehicle_width) / 2.0 or
+			gap <= 0.0 or closing <= 0.5) { return 99.0; }
+		return gap / closing;
+	}
 
 	// HIỂN THỊ CHUYỂN LÀN MƯỢT MÀ (SMOOTHERSTEP)
 	bool lateral_shift_initialized <- false;
@@ -1389,18 +1417,18 @@ species base_vehicle_species skills: [driving] parallel: false {
 		// 1. Giam sat gia toc & phanh khanc cap (Hard-Braking)
 		current_acc <- (measured_speed - prev_speed) / step;
 		prev_speed <- measured_speed;
-		if (current_acc < -3.4) {
+		if (current_acc < -3.4 and !was_hard_braking) {
 			hard_braking_count <- hard_braking_count + 1;
-			if (current_acc < -5.0) {
-				panic_braking_count <- panic_braking_count + 1;
-			}
 		}
+		if (current_acc < -5.0 and !was_panic_braking) { panic_braking_count <- panic_braking_count + 1; }
+		was_hard_braking <- current_acc < -3.4;
+		was_panic_braking <- current_acc < -5.0;
 
-		// 2. Quet TTC 2D Circular Buffer O(1) ban kinh 15m
-		// A3 FIX: Chỉ đếm mỗi cặp xe 1 lần (ordered pair: self.name < target_v.name)
+		// Each following pair is counted by its rear vehicle, independent of names.
+		list<base_vehicle_species> severe_now <- [];
 		list<base_vehicle_species> neighbors <- base_vehicle_species at_distance 15.0 #m;
 		loop target_v over: neighbors {
-			if (target_v != self and target_v.final_target != nil and self.name < target_v.name and
+			if (target_v != self and target_v.final_target != nil and
 				abs(surface_height() - target_v.surface_height()) < 2.5) {
 				float bearing <- self.location direction_to target_v.location;
 				float angle_diff <- abs(heading - bearing);
@@ -1411,7 +1439,7 @@ species base_vehicle_species skills: [driving] parallel: false {
 					float gap <- distance_to(self.location, target_v.location) - (self.vehicle_length / 2.0 + target_v.vehicle_length / 2.0);
 
 					if (rel_speed > 0.5 and gap > 0.0) {
-						float ttc <- gap / rel_speed;
+						float ttc <- following_ttc(target_v);
 						if (ttc < min_ttc_experienced) { min_ttc_experienced <- ttc; }
 
 						// Do lech tam CS (Centerline Separation - Das & Maurya 2020)
@@ -1430,7 +1458,10 @@ species base_vehicle_species skills: [driving] parallel: false {
 							total_tit_sum <- total_tit_sum + d_tit;
 
 							if (ttc < 1.0) {
-								severe_conflicts_count <- severe_conflicts_count + 1;
+								severe_now <- severe_now + target_v;
+								if (!(previous_severe_partners contains target_v)) {
+									severe_conflicts_count <- severe_conflicts_count + 1;
+								}
 							}
 						}
 
@@ -1443,6 +1474,7 @@ species base_vehicle_species skills: [driving] parallel: false {
 				}
 			}
 		}
+		previous_severe_partners <- severe_now;
 
 		// 3. Cam bien Vung phan van (Dilemma Zone)
 		float dist_center <- distance_to(self.location, intersection_center);

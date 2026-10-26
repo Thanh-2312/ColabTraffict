@@ -39,6 +39,15 @@ EXTRA_FIELDS = [
 ]
 PACK = STATE_PACK_EXPR + ''.join(f' + "|" + {name}' for name in EXTRA_FIELDS)
 MODEL = ROOT / "Traffic/models/intersection-benchmark.gaml"
+SOURCE_PATHS = (MODEL, ROOT / "Traffic/models/intersection-dqn-legacy.gaml",
+                ROOT / "Traffic/includes/collision_avoidance.gaml",
+                ROOT / "Traffic/includes/doan_scenery.gaml", ROOT / "dqn_py/gama_env.py",
+                ROOT / "dqn_py/dqn_agent.py", Path(__file__))
+
+
+def source_hashes():
+    return {str(p.relative_to(ROOT)): hashlib.sha256(p.read_bytes()).hexdigest()
+            for p in SOURCE_PATHS}
 
 
 def generate_demand(path, seed, horizon):
@@ -68,6 +77,7 @@ def generate_demand(path, seed, horizon):
 class BenchmarkEnv(GamaTrafficEnv):
     def __init__(self, port, manager=None, output=None):
         super().__init__(port=port, model_path=str(MODEL), experiment="benchmark_server", verbose=False)
+        self.action_count = 2
         self.manager = manager
         self.output = output
         self.episode_number = 0
@@ -158,6 +168,10 @@ class Learners:
 
     def learn(self, s, action, reward, next_s, done, seconds):
         # Semi-Markov discount and integrated reward account for unequal durations.
+        if action not in (0, 1) or not math.isfinite(reward) or not math.isfinite(seconds) or seconds <= 0:
+            raise ValueError("Invalid Q/DQN transition")
+        if not done and (next_s["global_phase"] not in (0, 4) or next_s["green_cycles"] >= 600):
+            raise ValueError("Q/DQN bootstrap requires a legal decision state")
         discount = 0.97 ** (seconds / 5.0)
         item = (features(s), tabular_key(s), action, reward, features(next_s),
                 tabular_key(next_s), done, discount)
@@ -224,10 +238,12 @@ class Learners:
 async def run_episode(env, learners, method, seed, horizon, demand_path, output,
                       train=False, epsilon=0.0, collect_only=False):
     demand_hash = hashlib.sha256(demand_path.read_bytes()).hexdigest()
+    sources = source_hashes()
     if (not train or collect_only) and (output / "metrics.json").exists():
         saved = json.loads((output / "metrics.json").read_text())
         if (saved.get("policy_sha256") == learners.policy_digest() and
                 saved.get("demand_sha256") == demand_hash and
+                saved.get("source_sha256") == sources and
                 saved.get("method") == method and saved.get("seed") == seed and
                 saved.get("horizon") == horizon and saved.get("training") == train and
                 saved.get("epsilon") == epsilon and
@@ -290,10 +306,13 @@ async def run_episode(env, learners, method, seed, horizon, demand_path, output,
         prev, action = pending
         reward = -(state["queue_time_integral"] - prev["queue_time_integral"]) / 50.0
         total_reward += reward
-        if train and not collect_only:
-            learners.learn(prev, action, reward, state, True, (state["cycle"] - prev["cycle"]) * .1)
-        if train:
-            collected.append([prev, action, reward, state, True, (state["cycle"] - prev["cycle"]) * .1])
+        # Horizon is a truncation of continuing traffic, not an absorbing state.
+        # Never bootstrap at an intermediate yellow/clearance/forced-left state.
+        if state["dqn_waiting_action"]:
+            if train and not collect_only:
+                learners.learn(prev, action, reward, state, False, (state["cycle"] - prev["cycle"]) * .1)
+            if train:
+                collected.append([prev, action, reward, state, False, (state["cycle"] - prev["cycle"]) * .1])
     errors = [m for m in env._server_messages if isinstance(m, dict) and m.get("type") in
               ("SimulationError", "RuntimeError", "GamaServerError", "SimulationErrorDialog")]
     if errors:
@@ -321,7 +340,9 @@ async def run_episode(env, learners, method, seed, horizon, demand_path, output,
                    unseen_q_states=unseen_states,
                    transitions=learners.transitions, updates=learners.updates,
                    seconds=round(time.monotonic()-t0, 2),
-                   policy_sha256=before_policy, demand_sha256=demand_hash)
+                   policy_sha256=before_policy, demand_sha256=demand_hash,
+                   source_sha256=sources,
+                   truncated_transition=bool(pending is not None and not state["dqn_waiting_action"]))
     output.mkdir(parents=True, exist_ok=True)
     if train:
         (output / "transitions.json").write_text(json.dumps(collected) + "\n")
@@ -412,11 +433,7 @@ async def pipeline(args, managers):
     output = args.output.resolve()
     output.mkdir(parents=True, exist_ok=True)
     learners = Learners(args.agent_seed)
-    source_paths = [MODEL, ROOT / "Traffic/models/intersection-dqn-python.gaml",
-                    ROOT / "Traffic/includes/collision_avoidance.gaml",
-                    ROOT / "Traffic/includes/doan_scenery.gaml", ROOT / "dqn_py/gama_env.py",
-                    ROOT / "dqn_py/dqn_agent.py", Path(__file__)]
-    sources = {str(p.relative_to(ROOT)): hashlib.sha256(p.read_bytes()).hexdigest() for p in source_paths}
+    sources = source_hashes()
     manifest = dict(train_episodes=args.train_episodes, horizon=args.horizon, agent_seed=args.agent_seed,
                     validate_every=args.validate_every, workers=args.workers,
                     train_seeds=list(range(1001, 1001 + args.train_episodes)),

@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Live DoAn/DQN integration check; requires a fresh GAMA server on --port."""
+"""Live DoAn/3DQN integration check; requires a fresh GAMA server on --port."""
 import argparse
 import asyncio
 import json
@@ -36,7 +36,9 @@ async def run(port, horizon):
         state = await env.read_state()
         decisions = []
         while state['cycle'] < horizon:
-            action = len(decisions) % 2
+            action = len(decisions) % 4
+            if not state['action_mask'][action]:
+                action = next(a for a in range(4) if state['action_mask'][a])
             before = state['cycle']
             try:
                 state, reward, done, info = await env.step(action)
@@ -47,7 +49,7 @@ async def run(port, horizon):
                 }
                 for key, expression in {
                     'yellow_cycles': 'yellow_cycles',
-                    'left_cycles': 'left_cycles',
+                    'all_red_cycles': 'all_red_cycles',
                     'phase_timer': 'phase_timer',
                     'connector_vehicles': 'string(active_vehicles where '
                         '(each.current_road != nil and road(each.current_road).is_signal_connector) '
@@ -67,9 +69,11 @@ async def run(port, horizon):
                         diagnostics[key] = str(error)
                 print('DQN_FAILURE_DIAGNOSTICS,' + json.dumps(diagnostics, default=str), flush=True)
                 raise
-            assert len(state) == len(STATE_FIELDS)
+            assert all(field in state for field in STATE_FIELDS)
             assert state['dqn_waiting_action'] and state['cycle'] > before
-            assert len(featurize(state)) == 8 and all(math.isfinite(float(x)) for x in featurize(state))
+            dtse = featurize(state)
+            assert dtse.shape == (3, 8, 20) and all(math.isfinite(float(x)) for x in dtse.flat)
+            assert math.isfinite(state['delay_sq']) and state['delay_sq'] >= 0
             assert math.isfinite(reward) and not done
             decisions.append(dict(action=action, cycle=state['cycle'], phase=state['global_phase'], reward=reward))
         ground = int(float(await env._exec_expression('total_vehicles_passed')))

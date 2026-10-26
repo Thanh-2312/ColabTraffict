@@ -22,7 +22,7 @@ global {
 	
 	// Q-Learning Hyperparameters
 	float alpha_lr <- 0.1;          // Tốc độ học (Learning rate)
-	float gamma_discount <- 0.9;    // Hệ số chiết khấu (Discount factor)
+	float gamma_discount <- 0.97;   // Discount per 5 simulation seconds
 	float epsilon <- 0.5;           // Xác suất kháĐm phá (Exploration rate)
 	float epsilon_decay <- 0.995;   // Giảm dần khám phá
 	float epsilon_min <- 0.05;      // Mức khám phá tối thiểu
@@ -34,6 +34,8 @@ global {
 	int current_action <- 0;
 	float last_reward <- 0.0;
 	int q_updates_count <- 0;
+	float prev_queue_integral <- 0.0;
+	float prev_decision_time <- 0.0;
 	
 	// Road collections for queue observation
 	list<road> ns_incoming_roads <- [];
@@ -72,7 +74,7 @@ global {
 		
 		// Yellow phases clear the intersection before the next movement opens.
 		if (global_phase mod 2 = 1) {
-			if (phase_timer >= yellow_time) {
+			if (phase_timer >= yellow_time + 2 #s and signal_junction_clear()) {
 				phase_timer <- 0.0;
 				global_phase <- (global_phase + 1) mod 8;
 			}
@@ -111,7 +113,8 @@ global {
 				if (queue_ew >= 15) { ew_lvl <- 2; }
 				else if (queue_ew >= 5) { ew_lvl <- 1; }
 				
-				string curr_state <- "" + global_phase + "_" + ns_lvl + "_" + ew_lvl;
+				// Green age distinguishes decisions with different legal durations.
+				string curr_state <- "" + global_phase + "_" + ns_lvl + "_" + ew_lvl + "_" + int(phase_timer / decision_interval);
 				
 				if not (q_table contains_key curr_state) {
 					q_table[curr_state] <- [0.0, 0.0];
@@ -120,15 +123,16 @@ global {
 				// 2. Tính Reward từ bước trước & Cập nhật Q-Table (Bellman Equation)
 				if (prev_state != "" and prev_action >= 0) {
 					// Reward âm tỷ lệ thuận với hàng đợi (khuyến khích giải tỏa nhanh)
-					float reward <- - float(current_queue_length);
+					float reward <- -(queue_time_integral - prev_queue_integral) / 50.0;
 					last_reward <- reward;
 					
 					list<float> curr_q <- q_table[curr_state];
-					float max_next_q <- max(curr_q);
+					float max_next_q <- force_switch ? curr_q[1] : max(curr_q);
+					float discount <- gamma_discount ^ ((time - prev_decision_time) / (5 #s));
 					
 					list<float> prev_q <- q_table[prev_state];
 					float old_val <- prev_q[prev_action];
-					float new_val <- (1.0 - alpha_lr) * old_val + alpha_lr * (reward + gamma_discount * max_next_q);
+					float new_val <- (1.0 - alpha_lr) * old_val + alpha_lr * (reward + discount * max_next_q);
 					prev_q[prev_action] <- new_val;
 					q_table[prev_state] <- prev_q;
 					q_updates_count <- q_updates_count + 1;
@@ -162,6 +166,8 @@ global {
 				// Lưu lại state và action để học ở bước kế tiếp
 				prev_state <- curr_state;
 				prev_action <- chosen_action;
+				prev_queue_integral <- queue_time_integral;
+				prev_decision_time <- time;
 				current_action <- chosen_action;
 				
 				// 4. Thực thi Action

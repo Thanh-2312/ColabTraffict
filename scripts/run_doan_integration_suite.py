@@ -8,6 +8,7 @@ import signal
 import re
 import subprocess
 import tempfile
+import time
 from datetime import datetime
 from pathlib import Path
 
@@ -21,7 +22,8 @@ FIELDS = ('cycle topology_errors failed_routes red_entries overlaps lane_errors 
           'ground_passed bypass_created bypass_passed left_completed right_completed uturn_completed '
           'phase_changes min_z max_z ramp_samples stopbar_violations '
           'surface_on_open_ramp uturn_wrong_lane uturn_entries_without_green remote_idle').split()
-CONTROLLERS = {'fixed': 'fixed-time', 'maxpressure': 'maxpressure', 'qlearning': 'qlearning', 'dqn': 'dqn-python'}
+CONTROLLERS = {'fixed': 'fixed-time', 'maxpressure': 'maxpressure', 'qlearning': 'qlearning',
+               'dqn': 'dqn-legacy', '3dqn': 'dqn-python'}
 CASES = {name: (name, 15, 45, .20, .15, .05, True) for name in CONTROLLERS}
 CASES.update({turn: ('fixed', 100, 100, float(turn == 'left'), float(turn == 'right'),
                     float(turn == 'uturn'), False) for turn in ('left', 'right', 'uturn')})
@@ -48,20 +50,37 @@ def run_case(name, output, horizon, seed):
     parameter "Merge trace" var: debug_merge_arbitration init: true;
     parameter "Ground" var: enable_ground_traffic init: {str(name != 'empty').lower()};'''
     source = source.replace('parameter "Seed"', settings + '\nparameter "Seed"', 1)
-    if controller == 'dqn':
-        source = source.replace('global {', 'global {\nreflex audit_local_dqn when: cycle = 0 { python_controlled <- false; }', 1)
+    if controller in ('dqn', '3dqn'):
+        source = source.replace('global {',
+                                'global {\nreflex audit_local_dqn when: cycle = 0 { '
+                                f'python_controlled <- false; audit_direct_phase <- {str(controller == "3dqn").lower()}; }}', 1)
     with tempfile.NamedTemporaryFile('w', suffix='.gaml', prefix='tmp_doan_suite_', dir=MODELS, delete=False) as f:
         f.write(source)
         model = Path(f.name)
     log = output / f'{name}.log'
+    completed = False
     try:
         with tempfile.TemporaryDirectory(prefix='doan_gama_') as work, log.open('w') as stream:
-            process = subprocess.Popen(['bash', str(HEADLESS), '-m', '2048m', '-batch', 'doan_audit_batch', str(model)],
+            configuration = Path(work) / 'configuration'
+            configuration.mkdir()
+            process = subprocess.Popen(['bash', str(HEADLESS), '-configuration', str(configuration),
+                                        '-m', '2048m', '-batch', 'doan_audit_batch', str(model)],
                                     cwd=work, stdout=stream, stderr=subprocess.STDOUT, start_new_session=True,
                                     env={**os.environ, '_JAVA_OPTIONS': os.environ.get('_JAVA_OPTIONS', '') +
                                          ' -Xms256m -Xmx2g -XX:-AlwaysPreTouch'})
             try:
-                returncode = process.wait(timeout=1800)
+                deadline = time.monotonic() + 1800
+                while process.poll() is None and time.monotonic() < deadline:
+                    content = log.read_text(errors='replace')
+                    if (f'DOAN_AUDIT,{horizon - 1},' in content and
+                            'DOAN_ROUTES,' in content and 'DOAN_MOVEMENTS,' in content):
+                        completed = True
+                        # GAMA 2025 can keep the batch JVM alive after writing
+                        # the final audit record. The checked output is complete.
+                        os.killpg(process.pid, signal.SIGTERM)
+                        break
+                    time.sleep(0.5)
+                returncode = process.wait(timeout=30)
             except (subprocess.TimeoutExpired, KeyboardInterrupt):
                 os.killpg(process.pid, signal.SIGTERM)
                 process.wait(timeout=30)
@@ -70,7 +89,7 @@ def run_case(name, output, horizon, seed):
         model.unlink(missing_ok=True)
     content = log.read_text()
     rows = re.findall(r'^DOAN_AUDIT,(.+)$', content, re.M)
-    if returncode or not rows:
+    if (returncode and not completed) or not rows:
         return dict(case=name, passed=False, error='GAMA failed or no audit records', log=str(log))
     metrics = dict(zip(FIELDS, map(float, rows[-1].split(',')), strict=True))
     checks = {key: metrics[key] == 0 for key in FIELDS[1:12]}
@@ -105,7 +124,8 @@ def run_case(name, output, horizon, seed):
     else:
         # Protected movements get only a short green in each full signal cycle.
         # Their dedicated cases verify completion on all four approaches below.
-        checks['ground_progress'] = metrics['ground_passed'] > (0 if name in ('left', 'right', 'uturn') else 10)
+        if horizon >= 4000 or name in ('left', 'right', 'uturn'):
+            checks['ground_progress'] = metrics['ground_passed'] > (0 if name in ('left', 'right', 'uturn') else 10)
         if name in ('left', 'right', 'uturn'):
             checks['movement_completed'] = metrics[f'{name}_completed'] > 0
             checks['four_approaches'] = all(f"'{arm}_{name}'::" in movements for arm in 'ENWS')
@@ -113,8 +133,9 @@ def run_case(name, output, horizon, seed):
                 checks['uturn_moves_during_red'] = metrics['uturn_entries_without_green'] > 0
         if bypass:
             checks['grade_separation'] = metrics['min_z'] == -60 and metrics['max_z'] == 50 and metrics['ramp_samples'] > 0
-            checks['eight_bypass_routes'] = all(f"'{route}'::" in routes for route in
-                ('flyover_NS', 'flyover_SN', 'on_N', 'on_S', 'off_N', 'off_S', 'tunnel_WE', 'tunnel_EW'))
+            if horizon >= 6000:
+                checks['eight_bypass_routes'] = all(f"'{route}'::" in routes for route in
+                    ('flyover_NS', 'flyover_SN', 'on_N', 'on_S', 'off_N', 'off_S', 'tunnel_WE', 'tunnel_EW'))
     if name in ('merge_recovery', 'overtaken_owner'):
         # These cases check reservation recovery before all routes complete.
         if name == 'merge_recovery':

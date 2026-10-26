@@ -18,7 +18,8 @@ global {
 		signal_phase_schedule <- phase_durations;
 		global_counter <- (round(global_counter / step) + 1) * step;
 		phase_timer <- global_counter;
-		if (global_counter >= phase_durations[global_phase]) {
+		float required <- phase_durations[global_phase] + (global_phase mod 2 = 1 ? 2 #s : 0 #s);
+		if (global_counter >= required and (global_phase mod 2 = 0 or signal_junction_clear())) {
 			global_counter <- 0.0;
 			phase_timer <- 0.0;
 			global_phase <- (global_phase + 1) mod length(phase_durations);
