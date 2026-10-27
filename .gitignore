@@ -32,6 +32,7 @@ test_vehicle_behavior_batch/
 comparison_results/
 diagnostics/
 dqn_py/run/
+scratch/
 .Rhistory
 *.bak
 Traffic/models/tmp_*.gaml

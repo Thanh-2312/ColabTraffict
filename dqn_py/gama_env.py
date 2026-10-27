@@ -27,9 +27,41 @@ import json
 import os
 import re
 
-import numpy as np
+# Vo hieu hoa nest_asyncio.apply vi no lam hong asyncio.current_task() tren Python 3.12+ (dac biet Python 3.14)
+try:
+    import nest_asyncio
+    nest_asyncio.apply = lambda *args, **kwargs: None
+except Exception:
+    pass
 
+import numpy as np
 from gama_client.sync_client import GamaSyncClient
+
+# Tang timeout mo WebSocket len 180s va vo hieu hoa keepalive ping timeout
+# (GAMA xu ly nang trong Java se bi cham phan hoi Ping -> gay loi 'sent 1011 keepalive ping timeout')
+try:
+    import websockets
+    _orig_ws_connect = websockets.connect
+    def _patched_ws_connect(*args, **kwargs):
+        kwargs["open_timeout"] = 180.0
+        kwargs["ping_interval"] = None
+        kwargs["ping_timeout"] = None
+        kwargs["close_timeout"] = 30.0
+        return _orig_ws_connect(*args, **kwargs)
+    websockets.connect = _patched_ws_connect
+    if hasattr(websockets, "legacy") and hasattr(websockets.legacy, "client"):
+        websockets.legacy.client.connect = _patched_ws_connect
+        if hasattr(websockets.legacy.client, "Connect"):
+            _orig_c_init = websockets.legacy.client.Connect.__init__
+            def _patched_c_init(self, *args, **kwargs):
+                kwargs["open_timeout"] = 180.0
+                kwargs["ping_interval"] = None
+                kwargs["ping_timeout"] = None
+                kwargs["close_timeout"] = 30.0
+                return _orig_c_init(self, *args, **kwargs)
+            websockets.legacy.client.Connect.__init__ = _patched_c_init
+except Exception:
+    pass
 
 # Duong dan mac dinh
 BASE_DIR = os.path.dirname(os.path.abspath(__file__))
@@ -117,16 +149,24 @@ class GamaTrafficEnv:
             print(f"[GamaEnv][SERVER-{mtype}] {message}")
 
     # ------------------------------------------------------------ lifecycle
-    async def setup(self):
+    async def setup(self, max_retries=15, retry_delay=3.0):
         """Connect to gama-server; first reset loads the seeded experiment."""
-        self.client = GamaSyncClient(
-            self.host, self.port,
-            other_message_handler=self._on_server_message,
-            default_timeout=self.timeout,
-        )
-        await self.client.connect_awaitable()
-        if self.verbose:
-            print(f"[GamaEnv] Da ket noi ws://{self.host}:{self.port}")
+        for attempt in range(1, max_retries + 1):
+            try:
+                self.client = GamaSyncClient(
+                    self.host, self.port,
+                    other_message_handler=self._on_server_message,
+                    default_timeout=self.timeout,
+                )
+                await self.client.connect_awaitable(ping_interval=None, ping_timeout=None)
+                if self.verbose:
+                    print(f"[GamaEnv] Da ket noi ws://{self.host}:{self.port}")
+                return
+            except (TimeoutError, asyncio.TimeoutError, OSError, Exception) as ex:
+                if attempt == max_retries:
+                    raise GamaEnvError(f"Khong the ket noi ws://{self.host}:{self.port} sau {max_retries} lan thu: {ex}")
+                print(f"[GamaEnv] Cho WebSocket port {self.port} on dinh (lan {attempt}/{max_retries})...")
+                await asyncio.sleep(retry_delay)
         # The first reset will load the model with its episode seed. Loading
         # here and immediately reloading it races GAMA's simulation startup.
 
@@ -159,7 +199,13 @@ class GamaTrafficEnv:
                 await asyncio.sleep(0.5)
         finally:
             if self.client is not None:
-                self.client.close_connection()
+                try:
+                    await self.client.close_connection_async()
+                except Exception:
+                    try:
+                        self.client.close_connection()
+                    except Exception:
+                        pass
                 self.client = None
             self.exp_id = None
 
@@ -288,13 +334,21 @@ class GamaTrafficEnv:
         if self.exp_id is None:
             await self.load_experiment(parameters=params)
         else:
-            await self.pause()
-            await asyncio.sleep(0.2)
-            resp = await self.client.reload_awaitable(
-                self.exp_id, parameters=params, timeout=self.timeout)
-            if resp.get("type") != "CommandExecutedSuccessfully":
-                raise GamaEnvError(f"Loi reload experiment (seed={seed}): {resp}")
-            await self.pause()
+            try:
+                await self.pause()
+                await asyncio.sleep(0.2)
+                resp = await self.client.reload_awaitable(
+                    self.exp_id, parameters=params, timeout=self.timeout)
+                if resp.get("type") != "CommandExecutedSuccessfully":
+                    raise GamaEnvError(f"Loi reload experiment (seed={seed}): {resp}")
+                await self.pause()
+            except Exception as reload_err:
+                # Neu reload that bai hoac session bi mat ("Unable to find the experiment or simulation"),
+                # ta tu dong load lai mot experiment moi thay vi crash worker.
+                if self.verbose:
+                    print(f"[GamaEnv][Port {self.port}] Reload khong thanh cong ({reload_err}), dang load lai experiment moi...")
+                self.exp_id = None
+                await self.load_experiment(parameters=params)
         state = await self.read_state()
         if state["cycle"] != 0:
             raise GamaEnvError(f"Reset did not start at cycle 0: {state['cycle']}")
