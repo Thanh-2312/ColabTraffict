@@ -1,6 +1,6 @@
 # Traffic-Light-ABM
 
-> Hướng nghiên cứu hiện tại dùng GAMA làm môi trường mô phỏng chính. Xem [ý tưởng nghiên cứu giao thông hỗn hợp](Y_TUONG_NGHIEN_CUU_DQN_GIAO_THONG_HON_HOP.md) để review đầu vào 6 mặt phẳng, thí nghiệm bố cục xe và hai hướng Rainbow DQN / Max Pressure. Pipeline GAMA–Python bên dưới là nền tảng đã khôi phục từ lịch sử Git; đầu vào không gian mới chưa được nối vào GAMA.
+> Hướng nghiên cứu hiện tại dùng GAMA làm môi trường mô phỏng chính. Xem [đề xuất nghiên cứu](reports/research.md) về state sáu kênh và Rainbow DQN / Max Pressure. Cả Rainbow và 3DQN lai Max Pressure đã được nối với bốn reward R1–R4 trên mạng đường GAMA hiện tại; nút khảo sát Lê Văn Lương – Vành Đai 2.5 vẫn cần hiệu chỉnh từ dữ liệu thực địa.
 
 Nguyên mẫu mô phỏng Python/C++ độc lập đã được dọn khỏi cây làm việc. Mã nguồn, dữ liệu và kết quả cũ được giữ trong [kho lưu trữ](legacy_archives/README.md); môi trường ảo và bản build đã bỏ.
 
@@ -46,7 +46,7 @@ Các experiment `my_batch_experiment` chạy mô phỏng không có giao diện.
 
 ## Huấn luyện Q-learning, DQN và 3DQN trên cùng giao diện GAMA
 
-Ba thuật toán dùng cùng DTSE `3×8×20`, bốn action pha xanh, action mask, lịch yêu cầu xe theo seed và reward. Q-learning rời rạc hóa số xe dừng/đang tới theo bốn nhóm chuyển động; DQN dùng mạng phẳng; 3DQN dùng CNN, Double DQN và nhánh dueling. Đây là đường train bốn pha để so sánh ba thuật toán. Đầu vào sáu mặt phẳng trong [đề xuất nghiên cứu](Y_TUONG_NGHIEN_CUU_DQN_GIAO_THONG_HON_HOP.md) chưa được triển khai trong GAMA.
+Ba thuật toán dùng cùng DTSE `3×8×20`, bốn action pha xanh, action mask, lịch yêu cầu xe theo seed và reward. Q-learning rời rạc hóa số xe dừng/đang tới theo bốn nhóm chuyển động; DQN dùng mạng phẳng; 3DQN dùng CNN, Double DQN và nhánh dueling. Đây là đường train bốn pha để so sánh ba thuật toán. Nhánh Rainbow bên dưới dùng state sáu kênh riêng trên cùng mạng đường.
 
 Ví dụ huấn luyện với reward thời gian chờ của xe trong mạng **và** xe còn đợi phát ngoài mạng, cùng hai GAMA worker độc lập:
 
@@ -56,7 +56,7 @@ dqn_py/venv/bin/python dqn_py/train.py --algorithm dqn --reward-mode total_wait 
 dqn_py/venv/bin/python dqn_py/train.py --algorithm 3dqn --reward-mode total_wait --workers 2 --total-steps 1000000 --episode-horizon 8000 --start-server
 ```
 
-Mặc định `--demand-mode paired` tạo một CSV lịch yêu cầu xe cho mỗi seed, dùng chung giữa ba thuật toán; xe chưa vào được mạng vẫn ở hàng đợi ngoài mạng. Có thể dùng `--demand-mode model` để phát xe trực tiếp trong GAMA, nhưng seed khi đó không bảo đảm lịch xe giống nhau giữa các chính sách. Mỗi worker chạy một GAMA Server trên CPU với Java heap tối đa 2 GB (`--gama-heap-mb`) và chỉ thu thập transition. Một learner cập nhật trên thiết bị PyTorch khả dụng (CUDA/MPS/CPU), nhận các episode theo thứ tự seed sau mỗi đợt thu thập. Reward `total_wait` là âm của gia số `(queue_time_integral + external_wait_integral)/50`, dùng discount theo thời gian thực giữa hai quyết định. `queue_time` chỉ tính xe đã vào mạng; `reference` dùng delay bình phương tốc độ theo bài báo. Với nhiều worker và reward `reference`, phải truyền cùng một `--max-delay-sq` cố định dương cho mọi worker; mặc định chạy một worker nếu muốn giữ chuẩn hóa cực đại chạy theo bài tham khảo. Việc tắt TTC/TIT/PET đã đo nhanh hơn nhưng làm thay đổi quỹ đạo cùng seed, nên đường train luôn bật các phép đo này.
+Mặc định `--demand-mode paired` tạo một CSV lịch yêu cầu xe cho mỗi seed, dùng chung giữa ba thuật toán; xe chưa vào được mạng vẫn ở hàng đợi ngoài mạng. Có thể dùng `--demand-mode model` để phát xe trực tiếp trong GAMA, nhưng seed khi đó không bảo đảm lịch xe giống nhau giữa các chính sách. Mỗi worker chạy một GAMA Server trên CPU với Java heap tối đa 2 GB (`--gama-heap-mb`) và chỉ thu thập transition. Một learner cập nhật trên thiết bị PyTorch khả dụng (CUDA/MPS/CPU), nhận dữ liệu từ các worker theo thứ tự seed. Khi chạy nhiều worker, mỗi worker gửi tối đa 16 quyết định mỗi lượt (`--rollout-decisions`), sau đó nhận chính sách mới và tiếp tục cùng episode GAMA. Reward `total_wait` là âm của gia số `(queue_time_integral + external_wait_integral)/50`, dùng discount theo thời gian thực giữa hai quyết định. `queue_time` chỉ tính xe đã vào mạng; `reference` dùng delay bình phương tốc độ theo bài báo. Với nhiều worker và reward `reference`, phải truyền cùng một `--max-delay-sq` cố định dương cho mọi worker; mặc định chạy một worker nếu muốn giữ chuẩn hóa cực đại chạy theo bài tham khảo. Các chỉ số TTC/TIT/PET mặc định tắt; nếu bật, quỹ đạo có thể đổi và phải dùng cùng cấu hình khi so sánh.
 
 Kết quả ở `dqn_py/run/<algorithm>_<timestamp>/`: `best_weights.pt` chọn theo hai seed validation 10.000.001–10.000.002 mặc định mỗi 50 episode, `dqn_weights.pt` là policy cuối, `checkpoint.pt` và `training_state.pt` mặc định lưu mỗi 50 episode. `training_state.pt` gồm replay, optimizer, RNG và bộ chuẩn hóa reward để tiếp tục học. Có thể điều chỉnh `--validate-every` và `--checkpoint-every` theo chi phí thời gian/đĩa. Dùng `--resume-dir` trỏ tới thư mục này và tăng `--total-steps` hoặc `--episodes` để tiếp tục; script từ chối nếu cấu hình hay mã mô hình đã đổi. Đánh giá từng policy trên seed test riêng, mặc định bắt đầu từ 20.000.001:
 
@@ -64,7 +64,55 @@ Kết quả ở `dqn_py/run/<algorithm>_<timestamp>/`: `best_weights.pt` chọn 
 dqn_py/venv/bin/python dqn_py/evaluate.py --weights /duong/dan/best_weights.pt --episodes 5 --start-server
 ```
 
-Từ bản sửa 19/10/2026, mọi controller dùng vàng 3 giây, đỏ toàn phần tối thiểu 2 giây và chờ xe đã vào nút thoát ra. 3DQN có action mask: không gia hạn quá 60 giây khi hướng khác có xe, và ưu tiên pha có nhu cầu chưa được phục vụ trong 120 giây. Ngưỡng 120 giây kích hoạt ưu tiên ở quyết định tiếp theo, không phải cam kết giới hạn thời gian chờ khi nút đang bị chặn. Mask được dùng cho cả khám phá, greedy và Double DQN target. GUI preview phục vụ cả bốn pha.
+Từ bản sửa 19/10/2026, mọi controller dùng vàng 3 giây, đỏ toàn phần tối thiểu 2 giây và chờ xe đã vào nút thoát ra. 3DQN có action mask hợp lệ cho bốn pha. Tùy chọn `dqn_service_guard` mặc định **tắt**; khi bật, guard không gia hạn quá 60 giây nếu pha khác có xe và ưu tiên pha đợi quá 120 giây ở quyết định tiếp theo. Mask được dùng cho khám phá, greedy và Double DQN target. GUI preview phục vụ cả bốn pha.
+
+## Tám trường hợp: Rainbow / 3DQN + Max Pressure × R1–R4
+
+Lệnh thử tích hợp ngắn trên mạng đường hiện tại:
+
+```bash
+dqn_py/venv/bin/python dqn_py/train.py --algorithm rainbow --total-steps 10 --episodes 1 --episode-horizon 1000 --warmup 2 --batch-size 2 --buffer-size 32 --start-server
+```
+
+Chạy đủ tám trường hợp với cùng seed, lịch xe và các hệ số reward:
+
+```bash
+dqn_py/venv/bin/python scripts/run_spatial_matrix.py --output-dir /duong/dan/ket_qua_8_truong_hop --total-steps 10 --episodes 1 --episode-horizon 1000 --warmup 2 --batch-size 2 --buffer-size 32
+```
+
+`run_spatial_matrix.py` tạo tám thư mục `rainbow_r1` … `hybrid_r4` và `matrix_manifest.json`. Dùng `--total-steps` lớn hơn, `--episodes 0` (mặc định) và các hệ số đã hiệu chỉnh để huấn luyện chính. Mỗi trường hợp dùng `train.py --algorithm rainbow|hybrid --reward-mode r1|r2|r3|r4`; `evaluate.py --weights <best_weights.pt>` nạp cả hai kiến trúc.
+
+Ví dụ Rainbow R1 với bốn GAMA worker độc lập và một learner:
+
+```bash
+dqn_py/venv/bin/python dqn_py/train.py --algorithm rainbow --reward-mode r1 \
+  --workers 4 --rollout-decisions 16 --start-server --port 6930 \
+  --total-steps 1000000 --episode-horizon 8000 --warmup 32 \
+  --batch-size 32 --buffer-size 4096 --max-train-seconds 600 \
+  --validate-every 1000000 --checkpoint-every 50 \
+  --output-dir dqn_py/run/rainbow_r1_4w
+```
+
+`--fast-simulation` bật mặc định cho `train.py`: GAMA bỏ cảnh trang trí, góc nghiêng thân xe chỉ để vẽ, chuỗi đếm ngược và log `METRIC_CSV` không được learner đọc; riêng R1 bỏ phép tính R2–R4 nhưng vẫn giữ nguyên dịch chuyển ngang, xe, pha đèn, state và tích phân R1. Dùng `--no-fast-simulation` để đối chiếu. Chế độ này không tự bật trong các script benchmark GAMA khác. [Kiểm tra 4 worker và tối ưu R1 ngày 07/11/2026](audits/spatial_4worker_20261107/README.md) có số đo cùng seed và phép đối chiếu quỹ đạo.
+
+[Kiểm thử 8 lượt × 10 phút ngày 06/11/2026](audits/spatial_10min_20261106/README.md) ghi tốc độ thực tế, checkpoint, lỗi Java ở ranh giới reload/close và kết quả chạy lại sau sửa. `run_spatial_matrix.py` quét log GAMA, ghi `server_error_count` vào manifest dù Python thoát mã 0.
+
+Để đo thử tốc độ trong 10 phút train cho mỗi cấu hình, truyền `--max-train-seconds 600 --warmup 32 --batch-size 32 --buffer-size 4096 --validate-every 1000000` cùng `--total-steps 1000000`. Script dừng ở ranh giới quyết định, lưu `dqn_weights.pt` và ghi số quyết định/giây, giây mô phỏng/giây thực vào `training_summary.json` và `matrix_manifest.json`. Thời gian khởi động và tắt GAMA được ghi riêng trong `wall_seconds`; `train_seconds` là thời gian thực của learner và các rollout song song, không cộng chồng thời gian từng worker. Một hàng `training_log.csv` là một rollout, có thể chỉ là một phần episode. Khi dừng vì giới hạn thời gian mà chưa đến lượt validation, dùng `dqn_weights.pt`; `best_weights.pt` chỉ xuất hiện sau validation.
+
+Rainbow dùng lưới `4×6×20×16` (E/N/W/S; xe máy, ô tô, xe nặng, tốc độ dọc, tốc độ ngang, mặt nạ đường) và 17 biến toàn nút gồm pha hiện tại, tuổi xanh, hàng chờ/xe đang tới, pressure bốn pha và action mask. Pressure trong đầu vào mạng được chia cho 50 rồi giới hạn vào [-1, 1]; nhánh chọn pha của Hybrid chuẩn hóa điểm pressure giữa các action hợp lệ. Ô dọc dài 8 m tính từ vạch dừng, ô ngang là một sublane; C0–C2 lưu tỷ phần footprint, C3 là tốc độ dọc trung bình có trọng số diện tích, C4 là vận tốc ngang có dấu lớn nhất của mỗi xe kể từ snapshot quyết định trước (chuẩn hóa theo 5 m/s, rồi trung bình theo diện tích trong ô), C5 là mặt nạ làn hợp lệ. Cách giữ đỉnh C4 tránh bỏ lỡ một lần đổi làn ngắn giữa hai quyết định cách nhau khoảng 10 giây. C4 lấy đạo hàm của nội suy chuyển làn hiển thị hiện có, vì vậy **chưa phải quỹ đạo lách ngang được hiệu chỉnh bằng video**. C5 hiện là 1 trên 16 sublane của mạng đều; sau khảo sát cần dựng lại mặt nạ theo hình học thật.
+
+**Rainbow** có PER, 3-step return, C51 51 atom, NoisyNet, Double DQN và Dueling Network. NoisyNet dùng để thăm dò sau warm-up ngẫu nhiên; Rainbow không dùng epsilon. **Hybrid** dùng CNN Dueling Double DQN trên cùng state, cộng điểm Q và điểm Max Pressure đã chuẩn hóa để chọn pha; `--pressure-lambda` (mặc định 0,5) chỉnh sức ảnh hưởng của Pressure. Pressure cho mỗi pha bằng tổng hàng chờ các chuyển động được phục vụ trừ hàng chờ ở đường ra tương ứng; chỉ đếm xe chậm dưới 5 km/h trong 160 m đường vào và 80 m đầu đường ra. Cả lựa chọn action lẫn Double DQN target của hybrid dùng quy tắc kết hợp này. Replay của hai agent nén state bằng zlib; mặc định 100.000 transition, warm-up 20.000. Mỗi action vẫn chọn một trong bốn pha hợp lệ của controller GAMA hiện tại.
+
+GAMA tích lũy bốn loại chi phí ở **mỗi tick**, kể cả thời gian vàng và đỏ. Reward bằng âm gia số chi phí giữa hai quyết định:
+
+| Reward | Chi phí tích lũy dùng trong mã | Tham số |
+| --- | --- | --- |
+| R1 | Thời gian mọi xe trong mạng **và** xe chờ vào mạng, gồm bypass | `--r1-ref` = $D_{ref}$ |
+| R2 | Thời gian mọi xe dừng dưới 1 km/h + $\lambda$ × thời gian xe chờ vào mạng | `--r2-ref` = $W_{ref}$; `--r2-lambda` |
+| R3 | R1 + $\beta$ × thời gian xe chậm dưới 5 km/h trong 80 m đầu đường ra | `--b-ref` = $B_{ref}$; `--r3-beta` |
+| R4 | Thời gian chậm so với tốc độ mong muốn riêng từng xe, trọng số PCU xe máy 0,3; ô tô 1; buýt 2; xe chưa vào mạng bị tính chậm hoàn toàn | `--r1-ref` = $D_{ref}$ |
+
+R3 trùng R1 ở các episode không có xe bị chặn tại đường ra; cần kiểm tra chỉ số `outgoing_block_integral` khi phân tích kết quả. Mặc định các mốc chuẩn hóa bằng 50 vehicle-second và $\lambda=\beta=1$ là **giá trị tạm cho prototype**. Trước thí nghiệm chính, đo fixed-time trên cùng nhu cầu để chọn hệ số cố định, rồi giữ nguyên giữa hai thuật toán. Discount dùng thời lượng thực của mỗi quyết định; Rainbow nhân các discount tương ứng trong n-step. Checkpoint lưu reward và hệ số để đánh giá đúng cấu hình; `training_state.pt` lưu replay/optimizer/RNG để resume. Kết quả trên mạng này chưa đại diện cho nút Lê Văn Lương – Vành Đai 2.5.
 
 Trong mỗi ô DTSE, tốc độ là **trung bình của các xe**, không phụ thuộc thứ tự duyệt. Occupancy vẫn nhị phân theo nhóm chuyển động, nên chưa biểu diễn mật độ theo từng làn vật lý. Checkpoint 3DQN cũ `dtse-v1` không dùng trực tiếp với hợp đồng state/controller mới; cần huấn luyện lại. `best_weights.pt` được chọn trên hai seed validation riêng theo thời gian chờ tích lũy; với `total_wait` phép chọn tính cả xe đợi ngoài mạng. Horizon là giới hạn thời gian: transition cuối bị cắt giữa action không được đưa vào replay; transition đầy đủ vẫn bootstrap, không coi giao thông là terminal khi đồng hồ hết giờ.
 

@@ -234,13 +234,25 @@ global {
 	int ground_pending <- 0;
 	int bypass_pending <- 0;
 	float queue_time_integral <- 0.0;
+	float system_time_integral <- 0.0; // R1: vehicle-seconds on roads and waiting to enter
+	float stopped_time_integral <- 0.0; // R2: stopped vehicle-seconds on all routes
+	float outgoing_block_integral <- 0.0; // R3: slow vehicles in first 80 m of ground exits
+	float weighted_delay_integral <- 0.0; // R4: PCU-weighted speed shortfall, including pending
+	float external_weighted_pending <- 0.0;
+	int total_lane_change_events <- 0; // diagnostic: actual lowest_lane changes on the same road
+	int near_lane_change_events <- 0; // lane changes inside the 160 m spatial observation window
 	float external_wait_integral <- 0.0;
+	float external_all_time_integral <- 0.0; // pending ground and bypass vehicle-seconds
 	float cumulative_max_wait <- 0.0;
 
 	float step <- 0.1 #s;
 	bool debug_vehicle_log <- false;
 	bool debug_merge_arbitration <- false;
 	bool enable_surrogate_safety <- false;
+	// Headless Python training can omit presentation and metrics that its reward
+	// does not use. Vehicle movement, signal timing and R1 remain unchanged.
+	bool fast_training <- false;
+	string training_reward_mode <- "all";
 	float lane_width <- 1.75 #m;  // Sublane width (motorcycle = 1 sublane = 1.5m; car = 2 sublanes = 3.0m)
 	int nb_lanes <- 16;           // 16 sublanes per road direction
 
@@ -490,7 +502,11 @@ global {
 	// A4: REFLEX CẬP NHẬT METRICS TẬP TRUNG (Centralized Metrics Update)
 	// =========================================================================
 	reflex update_metrics {
+		bool r1_only <- fast_training and training_reward_mode = "r1";
 		int queue <- 0;
+		int stopped_all <- 0;
+		int blocked_outgoing <- 0;
+		float weighted_delay <- external_weighted_pending;
 		float sum_wait <- 0.0;
 		float max_wait <- 0.0;
 		float sum_speed <- 0.0;
@@ -498,6 +514,21 @@ global {
 		int count <- 0;
 
 		loop v over: active_vehicles {
+			if (!r1_only and v.measured_speed < 1.0 #km/#h) { stopped_all <- stopped_all + 1; }
+			if (!r1_only and v.current_road != nil and v.location != nil and v.route_kind = "ground" and
+				road(v.current_road).is_outer_road and !road(v.current_road).is_incoming and
+				sqrt((v.location.x - intersection_center.x)^2 +
+					(v.location.y - intersection_center.y)^2) < distance_to_intersection_center + 80.0 #m and
+				v.measured_speed < 5.0 #km/#h) {
+				blocked_outgoing <- blocked_outgoing + 1;
+			}
+			if (!r1_only) {
+				float vehicle_weight <- v.vehicle_type = "motorcycle" ? 0.3 :
+					(v.vehicle_type = "bus" ? 2.0 : 1.0);
+				float desired <- max([0.1 #km/#h, v.original_max_speed]);
+				weighted_delay <- weighted_delay + vehicle_weight *
+					(1.0 - min([1.0, max([0.0, v.measured_speed / desired])]));
+			}
 			if (v.route_kind = "ground") {
 				count <- count + 1;
 				if (v.speed < 1.0 #km/#h) {
@@ -527,7 +558,7 @@ global {
 			current_queue_length <- 0;
 		}
 
-		if (cycle mod 10 = 0 and cycle > 0) {
+		if (!fast_training and cycle mod 10 = 0 and cycle > 0) {
 			write "METRIC_CSV," + cycle + "," + total_vehicles_passed + "," + (round(average_waiting_time*100.0)/100.0) + "," + current_queue_length + "," + (round(average_speed*100.0)/100.0) + "," + (round(average_travel_time*100.0)/100.0) + "," + (round(max_waiting_time*100.0)/100.0);
 			if (enable_surrogate_safety) {
 				write "SAFETY_CSV," + cycle + "," + (round(total_tit_sum*100.0)/100.0) + "," + (round(drac_max_observed*100.0)/100.0) + "," + severe_conflicts_count + "," + hard_braking_count + "," + pet_conflicts_count + "," + (round(min_pet_observed*100.0)/100.0) + "," + dilemma_zone_vehicles_count;
@@ -535,6 +566,15 @@ global {
 		}
 		queue_time_integral <- queue_time_integral + current_queue_length * step;
 		external_wait_integral <- external_wait_integral + ground_pending * step;
+		external_all_time_integral <- external_all_time_integral +
+			(ground_pending + bypass_pending) * step;
+		system_time_integral <- system_time_integral +
+			(length(active_vehicles) + ground_pending + bypass_pending) * step;
+		if (!r1_only) {
+			stopped_time_integral <- stopped_time_integral + stopped_all * step;
+			outgoing_block_integral <- outgoing_block_integral + blocked_outgoing * step;
+			weighted_delay_integral <- weighted_delay_integral + weighted_delay * step;
+		}
 		cumulative_max_wait <- max([cumulative_max_wait, max_waiting_time]);
 	}
 
@@ -544,6 +584,7 @@ global {
 	reflex load_replay_demand when: cycle = 0 and demand_file_path != "" {
 		replay_demand <- true;
 		replay_rows <- matrix<float>(csv_file(demand_file_path, ",", float, false));
+		external_weighted_pending <- 0.0;
 		loop origin from: 0 to: 11 { replay_queues[origin] <- []; }
 	}
 
@@ -552,6 +593,9 @@ global {
 			if (replay_rows[0, replay_cursor] > cycle) { break; }
 			int origin <- int(replay_rows[1, replay_cursor]);
 			replay_queues[origin] <- replay_queues[origin] + replay_cursor;
+			int requested_class <- int(replay_rows[2, replay_cursor]);
+			external_weighted_pending <- external_weighted_pending +
+				(requested_class = 0 ? 0.3 : (requested_class = 2 ? 2.0 : 1.0));
 			if (origin < 4) { ground_requests <- ground_requests + 1; }
 			else { bypass_requests <- bypass_requests + 1; }
 			replay_cursor <- replay_cursor + 1;
@@ -575,6 +619,8 @@ global {
 				}
 				if (total_vehicles_created + bypass_vehicles_created > before) {
 					replay_queues[origin] <- pending - row;
+					external_weighted_pending <- max([0.0, external_weighted_pending -
+						(replay_type = 0 ? 0.3 : (replay_type = 2 ? 2.0 : 1.0))]);
 				}
 			}
 		}
@@ -661,10 +707,10 @@ global {
 		ask intersection(3) { is_traffic_signal <- true; direction_type <- 0; do init_signal; } // South (p4)
 
 		// 5. Khoi tao 4 o xung dot trung tam cho PET sensor
-		do init_conflict_zones;
+		if (!fast_training or enable_surrogate_safety) { do init_conflict_zones; }
 
 		// 6. Khoi tao vach ke duong, vach di bo, cot den tin hieu truc quan
-		do init_doan_scenery;
+		if (!fast_training) { do init_doan_scenery; }
 	}
 }
 
@@ -981,6 +1027,10 @@ species base_vehicle_species skills: [driving] parallel: false {
 	// HIỂN THỊ CHUYỂN LÀN MƯỢT MÀ (SMOOTHERSTEP)
 	bool lateral_shift_initialized <- false;
 	float current_lateral_shift <- 0.0;
+	float lateral_velocity <- 0.0 #m/#s; // signed visual lane-change velocity; positive to vehicle's left
+	float recent_lateral_peak <- 0.0 #m/#s; // largest signed speed since the previous decision snapshot
+	road observed_lane_road <- nil;
+	int observed_lane_index <- -1;
 	float target_lateral_shift <- 0.0;
 	float start_lateral_shift <- 0.0;
 	float lane_change_progress <- 1.0;
@@ -1134,6 +1184,19 @@ species base_vehicle_species skills: [driving] parallel: false {
 	// REFLEX 0: NỘI SUY HIỂN THỊ CHUYỂN LÀN MƯỢT MÀ (SMOOTHERSTEP)
 	// =========================================================================
 	reflex smooth_lateral_movement when: current_road != nil {
+		if (location != nil and observed_lane_road = road(current_road) and observed_lane_index >= 0 and
+			observed_lane_index != lowest_lane) {
+			total_lane_change_events <- total_lane_change_events + 1;
+			float stop_distance <- sqrt((location.x - intersection_center.x)^2 +
+				(location.y - intersection_center.y)^2) -
+				distance_to_intersection_center - signal_node_to_stop_bar;
+			if (uses_signal and stop_distance >= 0.0 #m and stop_distance < 160.0 #m) {
+				near_lane_change_events <- near_lane_change_events + 1;
+			}
+		}
+		observed_lane_road <- road(current_road);
+		observed_lane_index <- lowest_lane;
+		lateral_velocity <- 0.0 #m/#s;
 		float ideal_dist <- (road(current_road).num_lanes - lowest_lane - mean(range(num_lanes_occupied - 1)) - 0.5) * road(current_road).sublane_width + road(current_road).render_offset(location);
 		if violating_oneway { ideal_dist <- -ideal_dist; }
 
@@ -1170,21 +1233,27 @@ species base_vehicle_species skills: [driving] parallel: false {
 
 			// Tính lateral velocity bằng finite difference
 			float lateral_vel <- (current_lateral_shift - old_lateral_shift) / max([0.001, step]);
+			lateral_velocity <- lateral_vel;
+			if (abs(lateral_vel) > abs(recent_lateral_peak)) {
+				recent_lateral_peak <- lateral_vel;
+			}
 
-			// Dùng atan2 để tính toán tự nhiên góc nghiêng theo vận tốc dạt ngang và tiến lên
-			float raw_yaw <- atan2(lateral_vel, max([1.0, speed]));
-			float max_yaw_allowed <- (vehicle_type = "motorcycle") ? 30.0 : ((vehicle_type = "car") ? 15.0 : 8.0);
-			raw_yaw <- max([-max_yaw_allowed, min([max_yaw_allowed, raw_yaw])]);
-
-			// Nội suy mượt mà để chống giật
-			current_yaw_deviation <- current_yaw_deviation + (raw_yaw - current_yaw_deviation) * 0.2;
+			if (!fast_training) {
+				// Yaw is read only by the GUI drawing and visual integration test.
+				float raw_yaw <- atan2(lateral_vel, max([1.0, speed]));
+				float max_yaw_allowed <- (vehicle_type = "motorcycle") ? 30.0 : ((vehicle_type = "car") ? 15.0 : 8.0);
+				raw_yaw <- max([-max_yaw_allowed, min([max_yaw_allowed, raw_yaw])]);
+				current_yaw_deviation <- current_yaw_deviation + (raw_yaw - current_yaw_deviation) * 0.2;
+			}
 		} else {
 			current_lateral_shift <- target_lateral_shift;
-			// Từ từ trả thẳng lái khi về đúng làn
-			if (abs(current_yaw_deviation) > 0.1) {
-				current_yaw_deviation <- current_yaw_deviation * 0.8;
-			} else {
-				current_yaw_deviation <- 0.0;
+			if (!fast_training) {
+				// Từ từ trả thẳng lái khi về đúng làn
+				if (abs(current_yaw_deviation) > 0.1) {
+					current_yaw_deviation <- current_yaw_deviation * 0.8;
+				} else {
+					current_yaw_deviation <- 0.0;
+				}
 			}
 		}
 	}

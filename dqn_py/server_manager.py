@@ -86,7 +86,10 @@ class GamaServerManager:
                "-configuration", configuration, "-data", workspace]
         server_env = {
             **os.environ,
-            "_JAVA_OPTIONS": os.environ.get("_JAVA_OPTIONS", "") + " -Xms256m -XX:-AlwaysPreTouch",
+            # GAMA's launcher appends its own -Xmx16G after -m. JVM applies
+            # _JAVA_OPTIONS last, keeping the requested per-worker cap real.
+            "_JAVA_OPTIONS": os.environ.get("_JAVA_OPTIONS", "") +
+                             f" -Xms256m -Xmx{self.heap_mb}m -XX:-AlwaysPreTouch",
         }
         print(f"[GamaServer] Dang khoi dong: {' '.join(cmd)}  (workdir={self.workdir})")
         print(f"[GamaServer] Log: {self.log_file}  (heap={self.heap_mb}MB, AlwaysPreTouch=off)")

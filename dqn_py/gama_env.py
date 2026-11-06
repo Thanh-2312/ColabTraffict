@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """
 ==============================================================================
-GAMA TRAFFIC ENV - WebSocket bridge for the four-phase DTSE 3DQN agent
+GAMA TRAFFIC ENV - WebSocket bridge for four-phase DTSE and spatial agents
 ==============================================================================
 Giao tiep voi gama-server qua thu vien chinh thuc `gama-client` (WebSocket).
 
@@ -56,6 +56,10 @@ STATE_PACK_EXPR = (
 DTSE_PACK_EXPR = ('"" + dtse_pack + "|" + dtse_delay_sq + "|" + '
                   'dtse_delay_sq_near + "|" + queue_time_integral + "|" + '
                   'external_wait_integral + "|" + dqn_action_mask')
+SPATIAL_PACK_EXPR = ('"" + spatial_pack + "|" + system_time_integral + "|" + '
+                     'stopped_time_integral + "|" + external_all_time_integral + "|" + '
+                     'outgoing_block_integral + "|" + weighted_delay_integral + "|" + '
+                     'spatial_pressure + "|" + dqn_action_mask')
 
 STATE_FIELDS = [
     "cycle", "global_phase", "green_cycles", "yellow_cycles",
@@ -93,11 +97,23 @@ class GamaTrafficEnv:
     def __init__(self, host="localhost", port=6868,
                  model_path=DEFAULT_MODEL, experiment="dqn_server_experiment",
                  verbose=True, timeout=600.0, reward_scope="all",
-                 reward_mode="reference", max_delay_sq=None):
+                 reward_mode="reference", max_delay_sq=None,
+                 state_mode="dtse", r1_ref=50.0, r2_ref=50.0, b_ref=50.0,
+                 r2_lambda=1.0, r3_beta=1.0, reset_mode="reload",
+                 fast_training=False):
         if reward_scope not in ("all", "near"):
             raise ValueError(f"Unknown reward scope: {reward_scope}")
-        if reward_mode not in ("reference", "queue_time", "total_wait"):
+        if reward_mode not in ("reference", "queue_time", "total_wait", "r1", "r2", "r3", "r4"):
             raise ValueError(f"Unknown reward mode: {reward_mode}")
+        if state_mode not in ("dtse", "spatial"):
+            raise ValueError(f"Unknown state mode: {state_mode}")
+        if reset_mode not in ("reload", "fresh"):
+            raise ValueError(f"Unknown reset mode: {reset_mode}")
+        if (state_mode == "spatial") != (reward_mode in ("r1", "r2", "r3", "r4")):
+            raise ValueError("Spatial state requires R1-R4; DTSE requires a legacy reward")
+        if (not all(np.isfinite(x) for x in (r1_ref, r2_ref, b_ref, r2_lambda, r3_beta)) or
+                min(r1_ref, r2_ref, b_ref) <= 0 or min(r2_lambda, r3_beta) < 0):
+            raise ValueError("Invalid R1-R4 normalization or coefficient")
         self.max_delay_sq = float(max_delay_sq) if max_delay_sq is not None else None
         self.host = host
         self.port = int(port)
@@ -107,6 +123,14 @@ class GamaTrafficEnv:
         self.timeout = float(timeout)
         self.reward_scope = reward_scope
         self.reward_mode = reward_mode
+        self.state_mode = state_mode
+        self.reset_mode = reset_mode
+        self.fast_training = bool(fast_training)
+        self.r1_ref = float(r1_ref)
+        self.r2_ref = float(r2_ref)
+        self.b_ref = float(b_ref)
+        self.r2_lambda = float(r2_lambda)
+        self.r3_beta = float(r3_beta)
         self.action_count = 4
         self.exp_id = None
         self.client = None
@@ -150,29 +174,54 @@ class GamaTrafficEnv:
         # gama-server may start the newly loaded GUI experiment immediately.
         # Pause before the first reload/step so its worker cannot mutate the
         # vehicle population while a new simulation is being initialized.
-        await self.pause()
+        await self.pause_until_stable()
         if self.verbose:
             print(f"[GamaEnv] Da load '{self.experiment}' -> exp_id={self.exp_id}")
         return self.exp_id
 
-    async def close(self):
+    async def close(self, stop_experiment=True):
         try:
             if self.client is not None and self.exp_id is not None:
-                await self.pause()
-                # Let the simulation worker finish its current reflex before
-                # disconnecting. Stopping a just-paused experiment can clear
-                # its agent scope while the traffic driving skill is running.
-                await asyncio.sleep(0.5)
+                await self.pause_until_stable()
+                if stop_experiment:
+                    # A standalone server must release its experiment. When
+                    # the trainer owns the entire JVM, the manager stops it
+                    # directly, avoiding GAMA disposing a busy agent scope.
+                    await asyncio.sleep(0.5)
+                    await self.stop_experiment()
+                    await asyncio.sleep(0.5)
         finally:
-            if self.client is not None:
-                self.client.close_connection()
-                self.client = None
-            self.exp_id = None
+            self.disconnect()
+
+    def disconnect(self):
+        """Drop the WebSocket after an owned temporary JVM has been stopped."""
+        if self.client is not None:
+            self.client.close_connection()
+            self.client = None
+        self.exp_id = None
 
     async def pause(self):
         resp = await self.client.pause_awaitable(self.exp_id, timeout=self.timeout)
         if resp.get("type") != "CommandExecutedSuccessfully":
             raise GamaEnvError(f"Could not pause GAMA experiment: {resp}")
+
+    async def pause_until_stable(self):
+        """Wait until two consecutive reads see the same paused cycle."""
+        await self.pause()
+        for _ in range(10):
+            before = int(float(await self._exec_expression("cycle")))
+            await asyncio.sleep(0.2)
+            after = int(float(await self._exec_expression("cycle")))
+            if before == after:
+                return
+            await self.pause()
+        raise GamaEnvError("GAMA kept stepping after pause; refusing to reload")
+
+    async def stop_experiment(self):
+        resp = await self.client.stop_awaitable(self.exp_id, timeout=self.timeout)
+        if resp.get("type") != "CommandExecutedSuccessfully":
+            raise GamaEnvError(f"Could not stop GAMA experiment: {resp}")
+        self.exp_id = None
 
     # ------------------------------------------------------------ primitives
     async def _exec_expression(self, expr):
@@ -206,10 +255,43 @@ class GamaTrafficEnv:
             else:
                 state[name] = float(val)
         if state["dqn_waiting_action"] or force_dtse:
+            action_name = "capture_spatial_state" if self.state_mode == "spatial" else "capture_dtse"
             resp = await self.client.ask_awaitable(
-                self.exp_id, "capture_dtse", "{}", "world.0", timeout=self.timeout)
+                self.exp_id, action_name, "{}", "world.0", timeout=self.timeout)
             if resp.get("type") != "CommandExecutedSuccessfully":
-                raise GamaEnvError(f"capture_dtse failed: {resp}")
+                raise GamaEnvError(f"{action_name} failed: {resp}")
+            if self.state_mode == "spatial":
+                packed = str(await self._exec_expression(SPATIAL_PACK_EXPR)).rsplit("|", 7)
+                if len(packed) != 8:
+                    raise GamaEnvError("Invalid spatial state payload")
+                (raw_spatial, system_integral, stopped_integral, external_integral,
+                 blocked_integral, weighted_integral, raw_pressure, raw_mask) = packed
+                values = np.asarray([float(x) for x in re.findall(
+                    r"[-+]?(?:\d*\.\d+|\d+\.?\d*)(?:[eE][-+]?\d+)?", raw_spatial
+                )], dtype=np.float32)
+                if values.size != 7680 or not np.isfinite(values).all():
+                    raise GamaEnvError(f"Spatial state has {values.size} finite values; expected 7680")
+                state["spatial"] = values.reshape(4, 6, 20, 16)
+                state["system_time_integral"] = float(system_integral)
+                state["stopped_time_integral"] = float(stopped_integral)
+                state["external_all_time_integral"] = float(external_integral)
+                state["outgoing_block_integral"] = float(blocked_integral)
+                state["weighted_delay_integral"] = float(weighted_integral)
+                state["pressure"] = np.asarray([float(x) for x in re.findall(
+                    r"[-+]?(?:\d*\.\d+|\d+\.?\d*)(?:[eE][-+]?\d+)?", raw_pressure
+                )], dtype=np.float32)
+                state["action_mask"] = np.asarray(
+                    [int(x) for x in re.findall(r"\d+", raw_mask)], dtype=np.bool_)
+                if (state["pressure"].shape != (4,) or
+                        not all(np.isfinite(state[name]) for name in
+                                ("system_time_integral", "stopped_time_integral",
+                                 "external_all_time_integral", "outgoing_block_integral",
+                                 "weighted_delay_integral")) or
+                        not np.isfinite(state["pressure"]).all()):
+                    raise GamaEnvError("Invalid spatial pressure or R1-R4 integral")
+                if state["action_mask"].shape != (4,) or not state["action_mask"].any():
+                    raise GamaEnvError(f"Invalid action mask: {raw_mask}")
+                return state
             packed = str(await self._exec_expression(DTSE_PACK_EXPR)).rsplit("|", 5)
             if len(packed) != 6:
                 raise GamaEnvError("Invalid DTSE metrics payload")
@@ -276,12 +358,30 @@ class GamaTrafficEnv:
         return 0.0 if norm == 0.0 else max(0.0, min(1.0, 1.0 - delay_sq / norm))
 
     def transition_reward(self, previous, current):
+        if self.reward_mode in ("r1", "r2", "r3", "r4"):
+            delta = self.reward_cost_from_state(current) - self.reward_cost_from_state(previous)
+            if not np.isfinite(delta) or delta < -1e-6:
+                raise GamaEnvError(f"Invalid {self.reward_mode} cost increment: {delta}")
+            return -max(0.0, delta)
         if self.reward_mode == "queue_time":
             return -(current["queue_time_integral"] - previous["queue_time_integral"]) / 50.0
         if self.reward_mode == "total_wait":
             return -((current["queue_time_integral"] - previous["queue_time_integral"]) +
                      (current["external_wait_integral"] - previous["external_wait_integral"])) / 50.0
         return self.reward_from_state(current)
+
+    def reward_cost_from_state(self, state):
+        if self.reward_mode == "r1":
+            return state["system_time_integral"] / self.r1_ref
+        if self.reward_mode == "r2":
+            return (state["stopped_time_integral"] +
+                    self.r2_lambda * state["external_all_time_integral"]) / self.r2_ref
+        if self.reward_mode == "r3":
+            return (state["system_time_integral"] / self.r1_ref +
+                    self.r3_beta * state["outgoing_block_integral"] / self.b_ref)
+        if self.reward_mode == "r4":
+            return state["weighted_delay_integral"] / self.r1_ref
+        raise ValueError("Cumulative cost is defined only for R1-R4")
 
     # -------------------------------------------------------------- gym API
     async def reset(self, seed=None, parameters=None):
@@ -293,19 +393,30 @@ class GamaTrafficEnv:
         """
         params = list(parameters or [])
         self._server_messages.clear()
+        if self.fast_training:
+            params.extend([
+                {"type": "bool", "value": "true", "name": "fast_training"},
+                {"type": "string", "value": self.reward_mode if self.reward_mode == "r1"
+                 else "all", "name": "training_reward_mode"},
+            ])
         if seed is not None:
             params.append({"type": "float", "value": str(float(int(seed))),
                            "name": "rng_seed"})
         if self.exp_id is None:
             await self.load_experiment(parameters=params)
         else:
-            await self.pause()
-            await asyncio.sleep(0.2)
-            resp = await self.client.reload_awaitable(
-                self.exp_id, parameters=params, timeout=self.timeout)
-            if resp.get("type") != "CommandExecutedSuccessfully":
-                raise GamaEnvError(f"Loi reload experiment (seed={seed}): {resp}")
-            await self.pause()
+            await self.pause_until_stable()
+            await asyncio.sleep(0.5)
+            if self.reset_mode == "fresh":
+                await self.stop_experiment()
+                await asyncio.sleep(0.5)
+                await self.load_experiment(parameters=params)
+            else:
+                resp = await self.client.reload_awaitable(
+                    self.exp_id, parameters=params, timeout=self.timeout)
+                if resp.get("type") != "CommandExecutedSuccessfully":
+                    raise GamaEnvError(f"Loi reload experiment (seed={seed}): {resp}")
+                await self.pause_until_stable()
         state = await self.read_state()
         if state["cycle"] != 0:
             raise GamaEnvError(f"Reset did not start at cycle 0: {state['cycle']}")
@@ -359,7 +470,8 @@ class GamaTrafficEnv:
         # delay observed since this environment was created. The first
         # nonzero delay gives 0.
         truncated = horizon is not None and next_state["cycle"] >= horizon
-        if truncated and "dtse" not in next_state:
+        observation_key = "spatial" if self.state_mode == "spatial" else "dtse"
+        if truncated and observation_key not in next_state:
             next_state = await self.read_state(force_dtse=True)
         reward = self.transition_reward(current_state, next_state)
         info = {"next_decision_in_cycles": advanced - 1,
@@ -375,4 +487,17 @@ STATE_DIM = (3, 8, 20)
 
 
 def featurize(state):
+    if "spatial" in state:
+        phase = state["global_phase"] // 2
+        aux = np.zeros(17, dtype=np.float32)
+        if 0 <= phase < 4:
+            aux[phase] = 1.0
+        aux[4] = min(1.0, state["green_cycles"] / 600.0)
+        aux[5:9] = np.clip([state["queue_ns"], state["queue_ew"],
+                            state["approach_ns"], state["approach_ew"]], 0, 100) / 100.0
+        pressure = np.asarray(state["pressure"], dtype=np.float32)
+        aux[9:13] = np.clip(pressure / 50.0, -1.0, 1.0)
+        aux[13:17] = state["action_mask"].astype(np.float32)
+        return {"grid": np.asarray(state["spatial"], dtype=np.float32), "aux": aux,
+                "pressure": pressure}
     return np.asarray(state["dtse"], dtype=np.float32)

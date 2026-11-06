@@ -44,6 +44,9 @@ global {
 	int all_red_cycles <- 0;
 	bool dqn_all_red <- false;
 	string dtse_pack <- "";
+	string spatial_pack <- "";
+	list<float> spatial_pressure <- [0.0,0.0,0.0,0.0];
+	int spatial_capture_cycle <- -1;
 	float dtse_delay_sq <- 0.0;
 	float dtse_delay_sq_near <- 0.0;
 	bool dqn_service_guard <- false; // Set to false to match paper's pure 4-phase 3DQN without heuristic phase forcing
@@ -96,6 +99,112 @@ global {
 			}
 		}
 		dtse_pack <- "" + cells;
+	}
+
+	// Research observation: [4 approaches E,N,W,S, 6 channels, 20 distance
+	// cells, 16 lateral cells]. C0-C2 are occupied footprint fractions by
+	// vehicle class; C3/C4 are footprint-weighted velocities; C5 is road mask.
+	// The present road graph has straight, uniform 16-sublane approaches.
+	action capture_spatial_state {
+		if (spatial_capture_cycle = cycle) { return; }
+		list<float> incoming_movement <- [];
+		list<float> outgoing_queue <- [0.0,0.0,0.0,0.0];
+		loop i from: 0 to: 7 { incoming_movement <- incoming_movement + 0.0; }
+		list<float> pixels <- [];
+		list<float> moving_area <- [];
+		loop i from: 0 to: 7679 { pixels <- pixels + 0.0; }
+		loop i from: 0 to: 1279 { moving_area <- moving_area + 0.0; }
+		loop arm from: 0 to: 3 {
+			loop h from: 0 to: 19 {
+				loop w from: 0 to: 15 {
+					pixels[(((arm * 6 + 5) * 20 + h) * 16 + w)] <- w < nb_lanes ? 1.0 : 0.0;
+				}
+			}
+		}
+		loop v over: active_vehicles {
+			if (v.current_road != nil and v.location != nil and v.route_kind = "ground" and
+				road(v.current_road).is_outer_road and !road(v.current_road).is_incoming and
+				v.destination_approach >= 4 and v.destination_approach <= 7 and
+				v.measured_speed < 5.0 #km/#h and
+				sqrt((v.location.x - intersection_center.x)^2 +
+					(v.location.y - intersection_center.y)^2) < distance_to_intersection_center + 80.0 #m) {
+				outgoing_queue[v.destination_approach - 4] <- outgoing_queue[v.destination_approach - 4] + 1.0;
+			}
+			if (v.current_road != nil and v.location != nil and v.uses_signal and v.approach_id >= 4 and v.approach_id <= 7 and
+				road(v.current_road).is_outer_road and road(v.current_road).is_incoming) {
+				road r <- road(v.current_road);
+				int arm <- v.approach_id - 4;
+				float along <- sqrt((v.location.x - intersection_center.x)^2 +
+					(v.location.y - intersection_center.y)^2) -
+					distance_to_intersection_center - signal_node_to_stop_bar;
+				if (along >= 0.0 #m and along < 160.0 #m and
+					v.measured_speed < 5.0 #km/#h) {
+					incoming_movement[arm * 2 + (v.maneuver = "left" ? 1 : 0)] <-
+						incoming_movement[arm * 2 + (v.maneuver = "left" ? 1 : 0)] + 1.0;
+				}
+				float along_lo <- along - v.vehicle_length / 2.0;
+				float along_hi <- along + v.vehicle_length / 2.0;
+				float lane_center <- r.num_lanes -
+					(v.current_lateral_shift - r.render_offset(v.location)) / r.sublane_width;
+				float across_lo <- lane_center - v.vehicle_width / (2.0 * r.sublane_width);
+				float across_hi <- lane_center + v.vehicle_width / (2.0 * r.sublane_width);
+				int first_h <- max([0, int(floor(along_lo / (8.0 #m)))]);
+				int last_h <- min([19, int(floor(along_hi / (8.0 #m)))]);
+				int first_w <- max([0, int(floor(across_lo))]);
+				int last_w <- min([15, int(floor(across_hi))]);
+				if (first_h <= last_h and first_w <= last_w) {
+					int type_channel <- v.vehicle_type = "motorcycle" ? 0 :
+						(v.vehicle_type = "car" ? 1 : 2);
+					float longitudinal_speed <- min([1.0, max([0.0, v.measured_speed / (50.0 #km/#h)])]);
+					// Peak since the last decision avoids missing a sub-second lane
+					// change between 10-second snapshots. Positive shift is left;
+					// C4 follows the proposal convention: negative left, positive right.
+					float transverse_speed <- max([-1.0, min([1.0,
+						-v.recent_lateral_peak / (5.0 #m/#s)])]);
+					loop h from: first_h to: last_h {
+						float overlap_long <- max([0.0 #m, min([along_hi, (h + 1) * 8.0 #m]) -
+							max([along_lo, h * 8.0 #m])]);
+						loop w from: first_w to: last_w {
+							float overlap_across <- max([0.0, min([across_hi, w + 1.0]) -
+								max([across_lo, float(w)])]);
+							float area <- overlap_long * overlap_across / (8.0 #m);
+							int pixel <- (((arm * 6 + type_channel) * 20 + h) * 16 + w);
+							int speed_pixel <- (arm * 20 + h) * 16 + w;
+							pixels[pixel] <- min([1.0, pixels[pixel] + area]);
+							pixels[(((arm * 6 + 3) * 20 + h) * 16 + w)] <-
+								pixels[(((arm * 6 + 3) * 20 + h) * 16 + w)] + area * longitudinal_speed;
+							pixels[(((arm * 6 + 4) * 20 + h) * 16 + w)] <-
+								pixels[(((arm * 6 + 4) * 20 + h) * 16 + w)] + area * transverse_speed;
+							moving_area[speed_pixel] <- moving_area[speed_pixel] + area;
+						}
+					}
+				}
+			}
+		}
+		// E,N,W,S are approach IDs 4..7. Pressure subtracts the queue at
+		// each movement's actual exit; both approaches served by a phase add.
+		spatial_pressure <- [
+			incoming_movement[2] - outgoing_queue[3] + incoming_movement[6] - outgoing_queue[1],
+			incoming_movement[3] - outgoing_queue[0] + incoming_movement[7] - outgoing_queue[2],
+			incoming_movement[0] - outgoing_queue[2] + incoming_movement[4] - outgoing_queue[0],
+			incoming_movement[1] - outgoing_queue[3] + incoming_movement[5] - outgoing_queue[1]
+		];
+		loop arm from: 0 to: 3 {
+			loop h from: 0 to: 19 {
+				loop w from: 0 to: 15 {
+					int local_index <- (arm * 20 + h) * 16 + w;
+					if (moving_area[local_index] > 0.0) {
+						int speed_index <- (((arm * 6 + 3) * 20 + h) * 16 + w);
+						int lateral_index <- (((arm * 6 + 4) * 20 + h) * 16 + w);
+						pixels[speed_index] <- pixels[speed_index] / moving_area[local_index];
+						pixels[lateral_index] <- pixels[lateral_index] / moving_area[local_index];
+					}
+				}
+			}
+		}
+		spatial_pack <- "" + pixels;
+		ask active_vehicles { recent_lateral_peak <- 0.0 #m/#s; }
+		spatial_capture_cycle <- cycle;
 	}
 
 	// =====================================================
@@ -248,14 +357,16 @@ global {
 				}
 			}
 		}
-		if (dqn_all_red) {
-			signal_display_seconds <- int(max([0, 20 - all_red_cycles]) * step / (1 #s) + 0.999);
-		} else if (global_phase mod 2 = 1) {
-			signal_display_seconds <- int((yellow_len_cycles - yellow_cycles) * step / (1 #s) + 0.999);
-		} else {
-			signal_display_seconds <- int(max([0, min_green_cycles - (green_cycles mod min_green_cycles)]) * step / (1 #s) + 0.999);
+		if (!fast_training) {
+			if (dqn_all_red) {
+				signal_display_seconds <- int(max([0, 20 - all_red_cycles]) * step / (1 #s) + 0.999);
+			} else if (global_phase mod 2 = 1) {
+				signal_display_seconds <- int((yellow_len_cycles - yellow_cycles) * step / (1 #s) + 0.999);
+			} else {
+				signal_display_seconds <- int(max([0, min_green_cycles - (green_cycles mod min_green_cycles)]) * step / (1 #s) + 0.999);
+			}
+			signal_countdown <- "" + signal_display_seconds + "s";
 		}
-		signal_countdown <- "" + signal_display_seconds + "s";
 	}
 
 	// =====================================================
@@ -282,6 +393,10 @@ experiment dqn_server_experiment type: gui autorun: false {
 	parameter "Phase service guard" var: dqn_service_guard;
 	parameter "Surrogate safety metrics" var: enable_surrogate_safety init: false;
 	parameter "Demand CSV" var: demand_file_path;
+	parameter "NS spawn interval" var: spawn_rate_NS;
+	parameter "EW spawn interval" var: spawn_rate_EW;
+	parameter "Bypass spawn interval" var: bypass_spawn_interval;
+	parameter "Enable bypass traffic" var: enable_bypass_traffic;
 	parameter "Python Controlled" var: python_controlled init: true;
 	parameter "Seed" var: seed init: 1093.0;
 	parameter "DQN_RNG_Seed" var: rng_seed init: 1093.0;

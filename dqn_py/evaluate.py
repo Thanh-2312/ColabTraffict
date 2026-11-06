@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """
 ==============================================================================
-EVALUATE 3DQN - Danh gia chinh sach da hoc (epsilon = 0, greedy policy)
+EVALUATE GAMA AGENTS - Danh gia chinh sach da hoc (greedy policy)
 ==============================================================================
 Chay N episode voi weights da train, moi 10 cycle doc metrics 1 lan
 (giong hang "METRIC_CSV" cua 3 model kia) va xuat CSV cung schema voi
@@ -11,7 +11,7 @@ compare_traffic_control.py:
     avg_speed, avg_travel_time, max_waiting_time, episode
 
 Ket qua: comparison_results/dqn_metrics.csv
--> co the ghep thang vao pipeline so sanh 4 thuat toan.
+-> co the ghep vao pipeline so sanh cac thuat toan.
 
 Vi du:
     venv/bin/python evaluate.py --weights run/train_YYYYMMDD_HHMMSS/dqn_weights.pt
@@ -27,6 +27,9 @@ import time
 import torch
 
 from three_dqn_agent import ThreeDQNAgent, FlatDQNAgent, ARCHITECTURE as THREE_ARCHITECTURE
+from rainbow_agent import (RainbowAgent, ARCHITECTURE as RAINBOW_ARCHITECTURE,
+                           LEGACY_ARCHITECTURE, PREVIOUS_ARCHITECTURE)
+from hybrid_agent import SpatialHybridAgent, ARCHITECTURE as HYBRID_ARCHITECTURE
 from tabular_agent import TabularQAgent, ARCHITECTURE as TABULAR_ARCHITECTURE
 from gama_env import GamaTrafficEnv, featurize
 from server_manager import GamaServerManager
@@ -79,7 +82,7 @@ async def evaluate_episode(env, agent, seed, horizon, writer, episode,
         if collect_samples:
             rows += int(write_sample(writer, state, episode, horizon))
     if pending is not None:
-        if "dtse" not in state:
+        if "dtse" not in state and "spatial" not in state:
             state = await env.read_state(force_dtse=True)
         reward += env.transition_reward(pending, state)
     return state, reward, decisions, rows
@@ -116,16 +119,44 @@ async def amain(args):
     try:
         if manager is not None:
             manager.start()
+        checkpoint = torch.load(args.weights, map_location="cpu", weights_only=False)
+        architecture = checkpoint.get("architecture")
+        is_spatial = architecture in (RAINBOW_ARCHITECTURE, LEGACY_ARCHITECTURE,
+                                      PREVIOUS_ARCHITECTURE,
+                                      HYBRID_ARCHITECTURE)
+        reward_options = dict(checkpoint.get("reward_settings", {}))
+        if is_spatial and "r1_ref" not in reward_options:
+            reward_options["r1_ref"] = checkpoint.get("r1_ref", 50.0)
         env = GamaTrafficEnv(host=args.host, port=args.port,
-                             experiment=args.experiment)
+                             experiment=args.experiment,
+                             reward_mode=checkpoint.get("reward_mode", "reference"),
+                             state_mode="spatial" if is_spatial else "dtse",
+                             **reward_options)
         await env.setup()
-        architecture = torch.load(args.weights, map_location="cpu", weights_only=False).get("architecture")
         agent_class = ({THREE_ARCHITECTURE: ThreeDQNAgent,
                         "gama-four-phase-flat-dqn-v1": FlatDQNAgent,
-                        TABULAR_ARCHITECTURE: TabularQAgent}).get(architecture)
+                        TABULAR_ARCHITECTURE: TabularQAgent,
+                        RAINBOW_ARCHITECTURE: RainbowAgent,
+                        LEGACY_ARCHITECTURE: RainbowAgent,
+                        PREVIOUS_ARCHITECTURE: RainbowAgent,
+                        HYBRID_ARCHITECTURE: SpatialHybridAgent}).get(architecture)
         if agent_class is None:
             raise ValueError(f"Unsupported checkpoint architecture: {architecture}")
-        agent = agent_class(buffer_size=1, warmup=1)
+        if architecture in (RAINBOW_ARCHITECTURE, LEGACY_ARCHITECTURE,
+                            PREVIOUS_ARCHITECTURE):
+            agent = agent_class(buffer_size=1, warmup=1, batch_size=1,
+                                atoms=checkpoint["atoms"], v_min=checkpoint["v_min"],
+                                v_max=checkpoint["v_max"], r1_ref=reward_options["r1_ref"],
+                                reward_mode=checkpoint["reward_mode"],
+                                reward_settings=reward_options,
+                                aux_size=17 if architecture == RAINBOW_ARCHITECTURE else 13)
+        elif architecture == HYBRID_ARCHITECTURE:
+            agent = agent_class(buffer_size=1, warmup=1, batch_size=1,
+                                pressure_lambda=checkpoint["pressure_lambda"],
+                                reward_mode=checkpoint["reward_mode"],
+                                reward_settings=reward_options)
+        else:
+            agent = agent_class(buffer_size=1, warmup=1)
         agent.load(args.weights)
         env.reward_mode = agent.reward_mode
         agent.eps = 0.0
