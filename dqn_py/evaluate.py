@@ -24,9 +24,13 @@ import csv
 import os
 import time
 
-from three_dqn_agent import ThreeDQNAgent
+import torch
+
+from three_dqn_agent import ThreeDQNAgent, FlatDQNAgent, ARCHITECTURE as THREE_ARCHITECTURE
+from tabular_agent import TabularQAgent, ARCHITECTURE as TABULAR_ARCHITECTURE
 from gama_env import GamaTrafficEnv, featurize
 from server_manager import GamaServerManager
+from demand import generate_demand, demand_parameters
 
 BASE_DIR = os.path.dirname(os.path.abspath(__file__))
 COMPARISON_DIR = os.path.join(os.path.dirname(BASE_DIR), "comparison_results")
@@ -48,8 +52,9 @@ def write_sample(writer, state, episode, horizon):
     return True
 
 
-async def evaluate_episode(env, agent, seed, horizon, writer, episode):
-    state = await env.reset(seed=seed)
+async def evaluate_episode(env, agent, seed, horizon, writer, episode,
+                           collect_samples=True, parameters=None):
+    state = await env.reset(seed=seed, parameters=parameters)
     pending = None
     reward = 0.0
     decisions = rows = 0
@@ -63,14 +68,16 @@ async def evaluate_episode(env, agent, seed, horizon, writer, episode):
             await env.step_cycles(1)
             decisions += 1
         else:
-            count = min(state["next_decision_in_cycles"], 10 - state["cycle"] % 10,
-                        horizon - state["cycle"])
+            count = min(state["next_decision_in_cycles"], horizon - state["cycle"])
+            if collect_samples:
+                count = min(count, 10 - state["cycle"] % 10)
             if count <= 0:
                 raise RuntimeError("Invalid DQN evaluation schedule")
             await env.step_cycles(count)
         # Always use GAMA's current schedule, including extensions of all-red.
         state = await env.read_state()
-        rows += int(write_sample(writer, state, episode, horizon))
+        if collect_samples:
+            rows += int(write_sample(writer, state, episode, horizon))
     if pending is not None:
         if "dtse" not in state:
             state = await env.read_state(force_dtse=True)
@@ -84,8 +91,9 @@ def parse_args():
                    help="File dqn_weights.pt / best_weights.pt tu train.py")
     p.add_argument("--episodes", type=int, default=1)
     p.add_argument("--episode-horizon", type=int, default=8000)
-    p.add_argument("--seed-base", type=int, default=5000,
+    p.add_argument("--seed-base", type=int, default=20_000_000,
                    help="Seed danh gia (khac voi seed train de tranh overfit)")
+    p.add_argument("--demand-mode", choices=("paired", "model"), default="paired")
     p.add_argument("--port", type=int, default=6868)
     p.add_argument("--host", type=str, default="localhost")
     p.add_argument("--start-server", action="store_true")
@@ -98,8 +106,12 @@ def parse_args():
 
 
 async def amain(args):
-
-    manager = GamaServerManager(port=args.port) if args.start_server else None
+    output_dir = os.path.dirname(os.path.abspath(args.output))
+    manager = (GamaServerManager(
+        port=args.port,
+        workdir=os.path.join(output_dir, "server_ws", str(args.port)),
+        log_file=os.path.join(output_dir, f"server_{args.port}.log"))
+        if args.start_server else None)
     env = None
     try:
         if manager is not None:
@@ -107,13 +119,19 @@ async def amain(args):
         env = GamaTrafficEnv(host=args.host, port=args.port,
                              experiment=args.experiment)
         await env.setup()
-        agent = ThreeDQNAgent(buffer_size=1, warmup=1)
+        architecture = torch.load(args.weights, map_location="cpu", weights_only=False).get("architecture")
+        agent_class = ({THREE_ARCHITECTURE: ThreeDQNAgent,
+                        "gama-four-phase-flat-dqn-v1": FlatDQNAgent,
+                        TABULAR_ARCHITECTURE: TabularQAgent}).get(architecture)
+        if agent_class is None:
+            raise ValueError(f"Unsupported checkpoint architecture: {architecture}")
+        agent = agent_class(buffer_size=1, warmup=1)
         agent.load(args.weights)
         env.reward_mode = agent.reward_mode
         agent.eps = 0.0
         print(f"[Eval] Da load weights: {args.weights} | policy = GREEDY (eps=0)")
 
-        os.makedirs(os.path.dirname(os.path.abspath(args.output)), exist_ok=True)
+        os.makedirs(output_dir, exist_ok=True)
         fieldnames = ["episode", "cycle", "time_sec", "throughput", "avg_waiting_time",
                       "queue_length", "avg_speed", "avg_travel_time", "max_waiting_time"]
         n_rows = 0
@@ -124,8 +142,15 @@ async def amain(args):
             for ep in range(1, args.episodes + 1):
                 seed = args.seed_base + ep
                 t0 = time.time()
+                parameters = None
+                if args.demand_mode == "paired":
+                    demand_path = os.path.join(os.path.dirname(os.path.abspath(args.output)),
+                                               "demand", f"seed_{seed}_h{args.episode_horizon}.csv")
+                    generate_demand(demand_path, seed, args.episode_horizon)
+                    parameters = demand_parameters(demand_path)
                 state, ep_reward, decisions, count = await evaluate_episode(
-                    env, agent, seed, args.episode_horizon, writer, ep)
+                    env, agent, seed, args.episode_horizon, writer, ep,
+                    parameters=parameters)
                 n_rows += count
 
                 print(f"[Eval] Ep {ep} | seed={seed} | reward={ep_reward:.1f} "

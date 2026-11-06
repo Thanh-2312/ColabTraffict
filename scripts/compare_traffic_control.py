@@ -77,11 +77,16 @@ def parse_record(line, pattern, fields):
 def run_simulation(model_path, model_name, output_dir):
     """Run GAMA and save CSVs only after a successful simulation."""
     print(f"\n🚀 Đang chạy mô phỏng: {model_name}...", flush=True)
-    command = ["bash", str(GAMA_HEADLESS), "-batch", "my_batch_experiment", str(model_path)]
+    command = ["bash", str(GAMA_HEADLESS), "-m", "2048m", "-batch", "my_batch_experiment", str(model_path)]
     mobility, safety = [], []
+    batch_env = {
+        **os.environ,
+        "_JAVA_OPTIONS": os.environ.get("_JAVA_OPTIONS", "") + " -Xms256m -Xmx2g -XX:-AlwaysPreTouch",
+    }
     with tempfile.TemporaryDirectory(prefix="gama_comparison_") as work:
         with subprocess.Popen(command, cwd=work, stdout=subprocess.PIPE,
-                              stderr=subprocess.STDOUT, text=True, bufsize=1) as process:
+                              stderr=subprocess.STDOUT, text=True, bufsize=1,
+                              env=batch_env) as process:
             for line in process.stdout:
                 metric = parse_record(line, MOBILITY_PATTERN, MOBILITY_FIELDS)
                 if metric:
@@ -98,15 +103,19 @@ def run_simulation(model_path, model_name, output_dir):
         raise RuntimeError(f"{model_name}: no METRIC_CSV rows; check model and experiment")
 
     expected = list(range(10, 8000, 10))
-    for kind, records in (("mobility", mobility), ("safety", safety)):
+    targets = [("mobility", mobility)]
+    if safety:
+        targets.append(("safety", safety))
+    for kind, records in targets:
         if [row["cycle"] for row in records] != expected:
             raise RuntimeError(f"{model_name}: incomplete {kind} sampling grid (expected cycles 10..7990)")
     metric_df = pd.DataFrame(mobility)
-    safety_df = pd.DataFrame(safety)
+    safety_df = pd.DataFrame(safety) if safety else None
     stem = MODELS[model_name][1]
     metric_df.to_csv(output_dir / f"{stem}_metrics.csv", index=False)
-    safety_df.to_csv(output_dir / f"{stem}_safety.csv", index=False)
-    print(f"✅ {model_name}: {len(metric_df)} mobility, {len(safety_df)} safety samples")
+    if safety_df is not None:
+        safety_df.to_csv(output_dir / f"{stem}_safety.csv", index=False)
+    print(f"✅ {model_name}: {len(metric_df)} mobility" + (f", {len(safety_df)} safety samples" if safety_df is not None else ""))
     return metric_df, safety_df
 
 
@@ -186,7 +195,7 @@ def main():
 
     print_summary("6 CHỈ SỐ LƯU THÔNG", mobility, MOBILITY_METRICS)
     plot_mobility(mobility, args.output_dir / "traffic_comparison_3models_mobility.png")
-    if all(not df.empty for df in safety.values()):
+    if all(df is not None and not df.empty for df in safety.values()):
         print_summary("7 CHỈ SỐ AN TOÀN VI MÔ", safety, SAFETY_METRICS)
         plot_safety(safety, args.output_dir / "traffic_comparison_3models_safety.png")
 

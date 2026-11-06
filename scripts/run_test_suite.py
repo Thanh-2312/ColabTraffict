@@ -12,6 +12,7 @@ Thực thi kiểm thử tự động toàn bộ Unit Tests và Edge Cases cho:
 """
 
 import os
+import signal
 import subprocess
 import re
 import time
@@ -41,12 +42,15 @@ def run_test_suite():
         os.makedirs(configuration, exist_ok=True)
         cmd = ["bash", GAMA_HEADLESS, "-configuration", configuration,
                "-batch", "my_batch_experiment", TEST_MODEL]
-        with subprocess.Popen(
+        process = subprocess.Popen(
             cmd, cwd=work, stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
             text=True, bufsize=1,
+            start_new_session=True,
             env={**os.environ, '_JAVA_OPTIONS': os.environ.get('_JAVA_OPTIONS', '') +
                  ' -Xms256m -Xmx2g -XX:-AlwaysPreTouch'}
-        ) as process:
+        )
+        completed = False
+        try:
             for line in process.stdout:
                 recent_output.append(line.rstrip())
                 line = line.strip()
@@ -66,10 +70,22 @@ def run_test_suite():
                         "status": status,
                         "message": message
                     })
-        if process.returncode != 0:
+                if "Số Test Cases HỎNG" in line:
+                    completed = True
+                    break
+        finally:
+            if process.poll() is None:
+                os.killpg(process.pid, signal.SIGTERM)
+            try:
+                process.wait(timeout=20)
+            except subprocess.TimeoutExpired:
+                os.killpg(process.pid, signal.SIGKILL)
+                process.wait(timeout=10)
+            process.stdout.close()
+        if not completed:
             details = "\n".join(recent_output)
             raise RuntimeError(
-                f"GAMA test process exited with code {process.returncode}. "
+                f"GAMA test process ended before its final report (code {process.returncode}). "
                 f"Recent output:\n{details}"
             )
     duration = time.time() - start_time

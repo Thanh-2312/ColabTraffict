@@ -29,6 +29,7 @@ sys.path.insert(0, str(ROOT / "dqn_py"))
 from dqn_agent import QNetwork
 from gama_env import GamaTrafficEnv, STATE_FIELDS, STATE_PACK_EXPR
 from server_manager import GamaServerManager
+from demand import generate_demand
 
 METHODS = ("Fixed-Time", "MaxPressure", "Q-Learning", "Deep Q-Learning")
 EXTRA_FIELDS = [
@@ -42,36 +43,12 @@ MODEL = ROOT / "Traffic/models/intersection-benchmark.gaml"
 SOURCE_PATHS = (MODEL, ROOT / "Traffic/models/intersection-dqn-legacy.gaml",
                 ROOT / "Traffic/includes/collision_avoidance.gaml",
                 ROOT / "Traffic/includes/doan_scenery.gaml", ROOT / "dqn_py/gama_env.py",
-                ROOT / "dqn_py/dqn_agent.py", Path(__file__))
+                ROOT / "dqn_py/dqn_agent.py", ROOT / "dqn_py/demand.py", Path(__file__))
 
 
 def source_hashes():
     return {str(p.relative_to(ROOT)): hashlib.sha256(p.read_bytes()).hexdigest()
             for p in SOURCE_PATHS}
-
-
-def generate_demand(path, seed, horizon):
-    """Pre-sample arrivals and attributes without using the controller RNG.
-
-    Keep original requested headways: NS 1.5s, EW 4.5s, bypass 12s/route.
-    CSV has no header so GAMA can load a numeric matrix without inference.
-    """
-    rng = random.Random(seed)
-    rows = []
-    for origin in range(12):
-        interval = 15 if origin < 2 else (45 if origin < 4 else 120)
-        for cycle in range(0, horizon, interval):
-            vtype = rng.choices([0, 1, 2], [.55, .38, .07])[0] if origin < 4 else 1
-            speed = (25 + rng.randint(0, 12) if vtype == 0 else
-                     30 + rng.randint(0, 15) if vtype == 1 else 22 + rng.randint(0, 10))
-            turn = rng.choices([0, 1, 2, 3], [.60, .20, .15, .05])[0] if origin < 4 and vtype != 2 else 0
-            lane = rng.randint(4, 11) if vtype == 0 else (8 if vtype == 2 else rng.choice([4, 8]))
-            rows.append((cycle, origin, vtype, speed, turn, lane))
-    rows.sort(key=lambda row: (row[0], row[1]))
-    path.parent.mkdir(parents=True, exist_ok=True)
-    with path.open("w", newline="") as stream:
-        csv.writer(stream).writerows(rows)
-    return hashlib.sha256(path.read_bytes()).hexdigest()
 
 
 class BenchmarkEnv(GamaTrafficEnv):

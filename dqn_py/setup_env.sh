@@ -3,8 +3,8 @@
 # Setup Python environment cho DQN traffic controller (Phuong an B: GAMA + PyTorch)
 # =============================================================================
 # Vi sao dung Python 3.11?
-#   PyTorch chua build wheel cho Python 3.14 (macOS x86_64) -> dung 3.11 co san
-#   trong may. Gama-client chay duoc tren moi phien ban Python.
+#   Moi truong Python 3.11 da duoc kiem thu voi PyTorch va gama-client trong
+#   du an; Python 3.14 tren may hien tai gap loi event loop cua gama-client.
 # =============================================================================
 set -e
 

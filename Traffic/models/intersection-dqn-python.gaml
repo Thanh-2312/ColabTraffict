@@ -129,48 +129,58 @@ global {
 	// REFLEX 1: Quan sat state moi cycle (den xanh + vang deu quan sat)
 	// =====================================================
 	reflex observe_state {
+		// During Python training with the service guard disabled, queue/demand
+		// snapshots are only consumed at decision ticks. Avoid scanning every
+		// active vehicle on the other ~99 cycles between decisions. Keep the
+		// per-cycle scan for the guarded policy and the interactive preview,
+		// where phase aging and the HUD are expected to update continuously.
+		bool refresh_observation <- dqn_service_guard or !python_controlled or dqn_waiting_action or
+			(global_phase mod 2 = 0 and green_cycles >= min_green_cycles - 1 and
+			 green_cycles mod min_green_cycles = min_green_cycles - 1);
+		if (refresh_observation) {
 			phase_demand <- [0,0,0,0];
-		if (empty(ns_incoming_roads) and length(intersection) > 3) {
-			ns_incoming_roads <- controller_roads(true,true);
-			ew_incoming_roads <- controller_roads(false,true);
-		}
-		queue_ns <- 0;
-		queue_ew <- 0;
-		approach_ns <- 0;
-		approach_ew <- 0;
-		loop v over: active_vehicles {
-			if (v.current_road != nil and v.uses_signal and distance_to(v.location,intersection_center) <= detector_distance) {
-				road r <- road(v.current_road);
-				bool is_ns <- ns_incoming_roads contains r;
-				bool is_ew <- ew_incoming_roads contains r;
-				if (is_ns or is_ew) {
-					int movement <- (is_ns ? 0 : 2) + (v.maneuver = "left" ? 1 : 0);
-					phase_demand[movement] <- phase_demand[movement] + 1;
-					if (v.speed < 1.0 #km/#h) {
-						if (is_ns) { queue_ns <- queue_ns + 1; } else { queue_ew <- queue_ew + 1; }
-					} else {
-						if (is_ns) { approach_ns <- approach_ns + 1; } else { approach_ew <- approach_ew + 1; }
+			if (empty(ns_incoming_roads) and length(intersection) > 3) {
+				ns_incoming_roads <- controller_roads(true,true);
+				ew_incoming_roads <- controller_roads(false,true);
+			}
+			queue_ns <- 0;
+			queue_ew <- 0;
+			approach_ns <- 0;
+			approach_ew <- 0;
+			loop v over: active_vehicles {
+				if (v.current_road != nil and v.uses_signal and distance_to(v.location,intersection_center) <= detector_distance) {
+					road r <- road(v.current_road);
+					bool is_ns <- ns_incoming_roads contains r;
+					bool is_ew <- ew_incoming_roads contains r;
+					if (is_ns or is_ew) {
+						int movement <- (is_ns ? 0 : 2) + (v.maneuver = "left" ? 1 : 0);
+						phase_demand[movement] <- phase_demand[movement] + 1;
+						if (v.speed < 1.0 #km/#h) {
+							if (is_ns) { queue_ns <- queue_ns + 1; } else { queue_ew <- queue_ew + 1; }
+						} else {
+							if (is_ns) { approach_ns <- approach_ns + 1; } else { approach_ew <- approach_ew + 1; }
+						}
 					}
 				}
 			}
-		}
-		// Expose restrictions before action selection; Python uses the same
-		// mask for exploration and Bellman bootstrap, so no action is relabelled.
-		dqn_action_mask <- [1,1,1,1];
-		int oldest <- -1;
-		loop a from: 0 to: 3 {
-			if (phase_demand[a] = 0 or (global_phase = a * 2 and !dqn_all_red)) {
-				phase_wait_cycles[a] <- 0;
-			} else { phase_wait_cycles[a] <- phase_wait_cycles[a] + 1; }
-			if (phase_wait_cycles[a] >= max_phase_wait_cycles and
-				(oldest < 0 or phase_wait_cycles[a] > phase_wait_cycles[oldest])) { oldest <- a; }
-		}
-		if (dqn_service_guard) {
-			if (oldest >= 0) {
-				dqn_action_mask <- [0,0,0,0]; dqn_action_mask[oldest] <- 1;
-			} else if (global_phase mod 2 = 0 and green_cycles >= max_green_cycles - 1) {
-				int current <- int(global_phase / 2);
-				if (sum(phase_demand) > phase_demand[current]) { dqn_action_mask[current] <- 0; }
+			// Expose restrictions before action selection; Python uses the same
+			// mask for exploration and Bellman bootstrap, so no action is relabelled.
+			dqn_action_mask <- [1,1,1,1];
+			int oldest <- -1;
+			loop a from: 0 to: 3 {
+				if (phase_demand[a] = 0 or (global_phase = a * 2 and !dqn_all_red)) {
+					phase_wait_cycles[a] <- 0;
+				} else { phase_wait_cycles[a] <- phase_wait_cycles[a] + 1; }
+				if (phase_wait_cycles[a] >= max_phase_wait_cycles and
+					(oldest < 0 or phase_wait_cycles[a] > phase_wait_cycles[oldest])) { oldest <- a; }
+			}
+			if (dqn_service_guard) {
+				if (oldest >= 0) {
+					dqn_action_mask <- [0,0,0,0]; dqn_action_mask[oldest] <- 1;
+				} else if (global_phase mod 2 = 0 and green_cycles >= max_green_cycles - 1) {
+					int current <- int(global_phase / 2);
+					if (sum(phase_demand) > phase_demand[current]) { dqn_action_mask[current] <- 0; }
+				}
 			}
 		}
 	}
@@ -182,8 +192,10 @@ global {
 		phase_timer <- phase_timer + step;
 		if (dqn_all_red) {
 			all_red_cycles <- all_red_cycles + 1;
-			// Paper specifies clearance Tr = 2s (20 cycles). Cap at 25 cycles (2.5s) to prevent red gridlock.
-			if (all_red_cycles >= 20 and (signal_junction_clear() or all_red_cycles >= 25)) {
+			// Keep all approaches red until every admitted vehicle clears the
+			// conflict area. A fixed 25-cycle cap could open a perpendicular
+			// phase while the previous movement was still inside the junction.
+			if (all_red_cycles >= 20 and signal_junction_clear()) {
 				dqn_all_red <- false;
 				all_red_cycles <- 0;
 				global_phase <- pending_green_phase;
@@ -268,6 +280,7 @@ global {
 // Experiment chinh cho Python/gama-server.
 experiment dqn_server_experiment type: gui autorun: false {
 	parameter "Phase service guard" var: dqn_service_guard;
+	parameter "Surrogate safety metrics" var: enable_surrogate_safety init: false;
 	parameter "Demand CSV" var: demand_file_path;
 	parameter "Python Controlled" var: python_controlled init: true;
 	parameter "Seed" var: seed init: 1093.0;

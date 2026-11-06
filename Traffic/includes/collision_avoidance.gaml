@@ -240,6 +240,7 @@ global {
 	float step <- 0.1 #s;
 	bool debug_vehicle_log <- false;
 	bool debug_merge_arbitration <- false;
+	bool enable_surrogate_safety <- false;
 	float lane_width <- 1.75 #m;  // Sublane width (motorcycle = 1 sublane = 1.5m; car = 2 sublanes = 3.0m)
 	int nb_lanes <- 16;           // 16 sublanes per road direction
 
@@ -249,7 +250,7 @@ global {
 	float distance_to_intersection_center <- 40.5 #m;
 	// Painted stop bars are 45 m from the centre; signal nodes are 40.5 m out.
 	float signal_node_to_stop_bar <- 4.5 #m;
-	float stop_bar_clearance <- 1.2 #m;
+	float stop_bar_clearance <- 2.0 #m;
 	float road_length <- 949.5 #m;
 
 	list<intersection> intersection_target_list;
@@ -491,26 +492,33 @@ global {
 	reflex update_metrics {
 		int queue <- 0;
 		float sum_wait <- 0.0;
-			float sum_speed <- 0.0;
-			int valid_speed_count <- 0;
-		list<base_vehicle_species> measured_vehicles <- active_vehicles where (each.route_kind = "ground");
-		int count <- length(measured_vehicles);
+		float max_wait <- 0.0;
+		float sum_speed <- 0.0;
+		int valid_speed_count <- 0;
+		int count <- 0;
 
-		if (count > 0) {
-			loop v over: measured_vehicles {
+		loop v over: active_vehicles {
+			if (v.route_kind = "ground") {
+				count <- count + 1;
 				if (v.speed < 1.0 #km/#h) {
 					queue <- queue + 1;
 				}
 				sum_wait <- sum_wait + v.waiting_time;
-					if (v.speed = v.speed and v.speed >= 0.0) {
-						sum_speed <- sum_speed + v.speed;
-						valid_speed_count <- valid_speed_count + 1;
-					}
+				if (v.waiting_time > max_wait) {
+					max_wait <- v.waiting_time;
+				}
+				if (v.speed = v.speed and v.speed >= 0.0) {
+					sum_speed <- sum_speed + v.speed;
+					valid_speed_count <- valid_speed_count + 1;
+				}
 			}
+		}
+
+		if (count > 0) {
 			average_waiting_time <- sum_wait / count;
-			max_waiting_time <- max(measured_vehicles collect each.waiting_time);
-				average_speed <- valid_speed_count > 0 ?
-					(sum_speed / valid_speed_count) * 3.6 : 0.0;
+			max_waiting_time <- max_wait;
+			average_speed <- valid_speed_count > 0 ?
+				(sum_speed / valid_speed_count) * 3.6 : 0.0;
 			current_queue_length <- queue;
 		} else {
 			average_waiting_time <- 0.0;
@@ -521,7 +529,9 @@ global {
 
 		if (cycle mod 10 = 0 and cycle > 0) {
 			write "METRIC_CSV," + cycle + "," + total_vehicles_passed + "," + (round(average_waiting_time*100.0)/100.0) + "," + current_queue_length + "," + (round(average_speed*100.0)/100.0) + "," + (round(average_travel_time*100.0)/100.0) + "," + (round(max_waiting_time*100.0)/100.0);
-			write "SAFETY_CSV," + cycle + "," + (round(total_tit_sum*100.0)/100.0) + "," + (round(drac_max_observed*100.0)/100.0) + "," + severe_conflicts_count + "," + hard_braking_count + "," + pet_conflicts_count + "," + (round(min_pet_observed*100.0)/100.0) + "," + dilemma_zone_vehicles_count;
+			if (enable_surrogate_safety) {
+				write "SAFETY_CSV," + cycle + "," + (round(total_tit_sum*100.0)/100.0) + "," + (round(drac_max_observed*100.0)/100.0) + "," + severe_conflicts_count + "," + hard_braking_count + "," + pet_conflicts_count + "," + (round(min_pet_observed*100.0)/100.0) + "," + dilemma_zone_vehicles_count;
+			}
 		}
 		queue_time_integral <- queue_time_integral + current_queue_length * step;
 		external_wait_integral <- external_wait_integral + ground_pending * step;
@@ -628,7 +638,8 @@ global {
 			managed_merge <- (length(roads_in) > 1 or length(roads_out) > 1) and
 				!empty((roads_in + roads_out) where (road(each).road_kind = "ramp" or road(each).road_kind = "tunnel" or
 				road(each).road_kind = "right" or road(each).road_kind = "uturn"));
-			merge_clearance <- !empty(roads_in where (road(each).road_kind = "ramp" or road(each).road_kind = "tunnel")) ? 35.0 :
+			merge_clearance <- !empty(roads_in where (road(each).road_kind = "ramp" or road(each).road_kind = "tunnel")) ?
+				((node_key = "F_SN1" or node_key = "F_NS1") ? 70.0 : 35.0) :
 				(!empty(roads_out where (road(each).road_kind = "ramp" or road(each).road_kind = "tunnel")) ? 25.0 :
 				(!empty((roads_in + roads_out) where
 					(road(each).road_kind = "uturn" or road(each).road_kind = "right")) ? 18.0 : 8.0));
@@ -670,6 +681,7 @@ species intersection skills: [intersection_skill] {
 	map<string, int> merge_owner_progress_cycle <- [];
 	map<string, int> merge_retry_cycle <- [];
 	map<string, int> merge_wait_since <- [];
+	map<string, int> ramp_stop_ticks <- [];
 
 	// Reserve each occupied lane across the physical convergence/divergence
 	// zone. Independent lanes can proceed together; followers wait for clearance.
@@ -682,7 +694,8 @@ species intersection skills: [intersection_skill] {
 			((each.current_road != nil and road(each.current_road).target_node = self) or
 			 (each.next_road != nil and road(each.next_road).target_node = self and
 			  each.current_road != nil and road(each.current_road).target_node != self) or
-			 distance_to(each.location,location) <= merge_clearance + each.vehicle_length / 2.0));
+			 (each.current_road != nil and road(each.current_road).source_node = self and
+			  distance_to(each.location,location) <= each.vehicle_length / 2.0 + 3.0 #m)));
 		list<base_vehicle_species> candidates <- [];
 		loop r over: roads_in {
 			road incoming <- road(r);
@@ -702,6 +715,31 @@ species intersection skills: [intersection_skill] {
 		loop candidate over: candidates {
 			if (!(merge_wait_since contains_key candidate.name) or merge_owners contains candidate) {
 				merge_wait_since[candidate.name] <- cycle;
+			}
+		}
+		// Once the head of an off-ramp has stopped for five seconds, reserve
+		// the next opening for it. Existing owners still clear normally; only
+		// new conflicting reservations from the through road are held back.
+		base_vehicle_species ramp_priority <- nil;
+		if (ramp_portal) {
+			loop candidate over: candidates {
+				bool stopped_ramp <- candidate.current_road != nil and
+					road(candidate.current_road).road_kind = "ramp" and
+					!(merge_owners contains candidate) and
+					candidate.measured_speed < 0.5 #km/#h;
+				ramp_stop_ticks[candidate.name] <- stopped_ramp ?
+					(ramp_stop_ticks contains_key candidate.name ? ramp_stop_ticks[candidate.name] + 1 : 1) : 0;
+				if (ramp_stop_ticks[candidate.name] >= 50) {
+					bool head_of_lane <- empty((road(candidate.current_road).all_agents collect base_vehicle_species(each)) where
+						(each != candidate and each.final_target != nil and
+						 each.distance_to_current_target < candidate.distance_to_current_target and
+						 each.lowest_lane < candidate.lowest_lane + candidate.num_lanes_occupied and
+						 each.lowest_lane + each.num_lanes_occupied > candidate.lowest_lane));
+					if (head_of_lane and (ramp_priority = nil or
+						ramp_stop_ticks[candidate.name] > ramp_stop_ticks[ramp_priority.name])) {
+						ramp_priority <- candidate;
+					}
+				}
 			}
 		}
 		// A reservation is for a vehicle approaching the conflict zone, not a
@@ -797,9 +835,13 @@ species intersection skills: [intersection_skill] {
 			 each.distance_to_current_target + road(each.next_road).shape.perimeter) {
 			// At an off-ramp, slot 9 is rendered beside ground slot 11.
 			// Reserve the neighbouring physical lanes as one merge path.
+			bool yields_to_ramp <- ramp_priority != nil and candidate != ramp_priority and
+				((candidate.lowest_lane < ramp_priority.lowest_lane + ramp_priority.num_lanes_occupied and
+				  candidate.lowest_lane + candidate.num_lanes_occupied > ramp_priority.lowest_lane) or
+				 (candidate.current_road != nil and abs(candidate.lowest_lane - ramp_priority.lowest_lane) <= 2));
 			int retry_after <- merge_retry_cycle contains_key candidate.name ?
 				merge_retry_cycle[candidate.name] : 0;
-			if (!(merge_owners contains candidate) and
+			if (!(merge_owners contains candidate) and !yields_to_ramp and
 				cycle >= retry_after and
 				empty(merge_owners where
 				((each.lowest_lane < candidate.lowest_lane + candidate.num_lanes_occupied and
@@ -1180,7 +1222,7 @@ species base_vehicle_species skills: [driving] parallel: false {
 			proba_respect_stops <- [through_respect, left_respect];
 			// Ứng xử vùng phân vân: đi tiếp nếu không còn đủ đường phanh ở đầu vàng.
 			// Xe còn đủ khoảng cách thì giảm tốc từ trước vạch dừng.
-			bool approaching_signal <- current_road != nil and
+			bool approaching_signal <- uses_signal and current_road != nil and
 				road(current_road).is_incoming and road(current_road).is_outer_road;
 			float to_stop_line <- max([0.0 #m, dist_to_center - distance_to_intersection_center]);
 			if (approaching_signal) {
@@ -1221,7 +1263,13 @@ species base_vehicle_species skills: [driving] parallel: false {
 							commanded_cap <- max([commanded_cap,
 								measured_speed - decel_factor * max_deceleration * step]);
 						}
-						max_speed <- min([max_speed, commanded_cap]);
+						// On the final approach, brake early and taper near the bar.
+						// Upstream short edges keep the gentler command; the stronger
+						// one caused hard braking there when a leader slowed.
+						bool final_signal_edge <- intersection(road(current_road).target_node).is_traffic_signal;
+						float command_factor <- final_signal_edge ? (measured_speed > 2.0 #km/#h ? 2.5 : 1.0) : 1.0;
+						max_speed <- min([max_speed,
+							max([commanded_cap, measured_speed - command_factor * max_deceleration * step])]);
 					}
 			}
 		// Hold left turns before the node until their protected phase grants entry.
@@ -1284,8 +1332,15 @@ species base_vehicle_species skills: [driving] parallel: false {
 		}
 		if (nearest_gap < 80 #m) {
 			float cap <- nearest_gap <= 0.0 ? 0.01 #km/#h :
-				sqrt(leader_speed * leader_speed + 0.5 * max_deceleration * nearest_gap);
-			max_speed <- min([max_speed, max([cap, measured_speed - max_deceleration * step])]);
+				min([sqrt(leader_speed * leader_speed + 1.2 * max_deceleration * nearest_gap),
+					leader_speed + nearest_gap / (2.5 #s)]);
+			if (maneuver = "uturn" and next_road != nil and
+				road(next_road).shape.perimeter < 30.0 #m and
+				nearest_gap < 8.0 #m) {
+				cap <- min([cap, nearest_gap / (4.0 #s)]);
+			}
+			float decel_allowance <- 2.0 * max_deceleration * step;
+			max_speed <- min([max_speed, max([cap, measured_speed - decel_allowance])]);
 		}
 	}
 
@@ -1295,22 +1350,41 @@ species base_vehicle_species skills: [driving] parallel: false {
 		road(next_road).road_kind = "ground" {
 		float nearest_gap <- 1e9 #m;
 		float leader_speed <- 0.0 #m/#s;
-		road following_edge <- road(next_road);
-		loop other over: following_edge.all_agents collect base_vehicle_species(each) {
-			if (other != self and other.final_target != nil and
-				other.lowest_lane < lowest_lane + num_lanes_occupied and
-				other.lowest_lane + other.num_lanes_occupied > lowest_lane) {
-				float progress <- following_edge.shape.perimeter - other.distance_to_current_target;
-				float gap <- distance_to_current_target + progress -
-					(vehicle_length + other.vehicle_length) / 2.0 - min_safety_distance - 2.0 #m;
-				if (gap < nearest_gap) { nearest_gap <- gap; leader_speed <- other.measured_speed; }
+		list<road> lookahead_edges <- [road(next_road)];
+		if (road(next_road).shape.perimeter < 30.0 #m) {
+			intersection mid_node <- intersection(road(next_road).target_node);
+			road edge_after <- first(mid_node.roads_out where (road(each).road_kind = "ground" and road(each).is_incoming));
+			if (edge_after != nil) {
+				lookahead_edges <- lookahead_edges + edge_after;
+			}
+		}
+		loop following_edge over: lookahead_edges {
+			float dist_to_following_edge <- following_edge = road(next_road) ?
+				distance_to_current_target :
+				distance_to_current_target + road(next_road).shape.perimeter;
+			loop other over: following_edge.all_agents collect base_vehicle_species(each) {
+				if (other != self and other.final_target != nil and
+					other.lowest_lane < lowest_lane + num_lanes_occupied and
+					other.lowest_lane + other.num_lanes_occupied > lowest_lane) {
+					float progress <- following_edge.shape.perimeter - other.distance_to_current_target;
+					float gap <- dist_to_following_edge + progress -
+						(vehicle_length + other.vehicle_length) / 2.0 - min_safety_distance - 2.0 #m;
+					if (gap < nearest_gap) { nearest_gap <- gap; leader_speed <- other.measured_speed; }
+				}
 			}
 		}
 		if (nearest_gap < 80 #m) {
 			float cap <- nearest_gap <= 0.0 ? 0.01 #km/#h :
-				min([sqrt(leader_speed * leader_speed + 0.5 * max_deceleration * nearest_gap),
-					leader_speed + nearest_gap / (2.0 #s)]);
-			max_speed <- min([max_speed, max([cap, measured_speed - max_deceleration * step])]);
+				min([sqrt(leader_speed * leader_speed + 1.2 * max_deceleration * nearest_gap),
+					leader_speed + nearest_gap / (2.5 #s)]);
+			// A leader on a short next edge can stop before DrivingSkill's
+			// connector transition sees it. Keep a small absolute headway speed
+			// close to that edge, even while the leader is still moving.
+			if (maneuver = "uturn" and road(next_road).shape.perimeter < 30.0 #m and nearest_gap < 8.0 #m) {
+				cap <- min([cap, nearest_gap / (4.0 #s)]);
+			}
+			float decel_allowance <- 2.0 * max_deceleration * step;
+			max_speed <- min([max_speed, max([cap, measured_speed - decel_allowance])]);
 		}
 	}
 
@@ -1413,7 +1487,7 @@ species base_vehicle_species skills: [driving] parallel: false {
 
 	// REFLEX 2: ĐO LƯỜNG AN TOÀN VI MÔ (SURROGATE SAFETY MEASURES - SSM)
 	// =========================================================================
-	reflex micro_safety_sensing when: final_target != nil {
+	reflex micro_safety_sensing when: final_target != nil and enable_surrogate_safety {
 		// 1. Giam sat gia toc & phanh khanc cap (Hard-Braking)
 		current_acc <- (measured_speed - prev_speed) / step;
 		prev_speed <- measured_speed;
@@ -1511,13 +1585,46 @@ species base_vehicle_species skills: [driving] parallel: false {
 				((approach_ns and global_phase = 1) or (!approach_ns and global_phase = 5));
 			float remaining <- distance_to_current_target - signal_node_to_stop_bar -
 				vehicle_length / 2.0 - stop_bar_clearance;
-			bool must_wait <- !has_green and !(has_yellow and yellow_commit) and
-				!(yellow_commit and remaining <= 0.0 #m) or
+			bool must_wait <- (!has_green and !(has_yellow and yellow_commit) and
+				!(yellow_commit and remaining <= 0.0 #m)) or
 				(maneuver = "left" and !left_committed and !left_entered);
-			if (must_wait and remaining <= max([0.35 #m, measured_speed * step])) {
-				measured_speed <- 0.0 #km/#h;
-				speed <- 0.0 #km/#h;
-				return;
+			if (must_wait and remaining <= max([0.5 #m, measured_speed * step])) {
+				if (measured_speed < 2.0 #km/#h or remaining <= 0.0 #m) {
+					measured_speed <- 0.0 #km/#h;
+					speed <- 0.0 #km/#h;
+					return;
+				}
+			}
+		}
+		// Prevent IDM free-flow creep from drifting into a converging merge while waiting for a reservation
+		if (current_target != nil) {
+			intersection merge_node <- intersection(current_target);
+			bool through_uturn_exit <- maneuver != "uturn" and
+				(merge_node.node_key = "E_U_OUT" or merge_node.node_key = "N_U_OUT" or
+				 merge_node.node_key = "W_U_OUT" or merge_node.node_key = "S_U_OUT");
+			if (merge_node.managed_merge and !through_uturn_exit and !(merge_node.merge_owners contains self)) {
+				float merge_usable <- distance_to_current_target - merge_node.merge_clearance -
+					vehicle_length / 2.0 - min_safety_distance - 2.0 #m;
+				if (merge_usable <= 0.0 #m and measured_speed < 1.5 #km/#h) {
+					measured_speed <- 0.0 #km/#h;
+					speed <- 0.0 #km/#h;
+					return;
+				}
+			}
+		}
+		if (next_road != nil) {
+			intersection ahead_node <- intersection(road(next_road).target_node);
+			bool through_ahead <- maneuver != "uturn" and
+				(ahead_node.node_key = "E_U_OUT" or ahead_node.node_key = "N_U_OUT" or
+				 ahead_node.node_key = "W_U_OUT" or ahead_node.node_key = "S_U_OUT");
+			if (ahead_node.managed_merge and !through_ahead and !(ahead_node.merge_owners contains self)) {
+				float ahead_usable <- distance_to_current_target + road(next_road).shape.perimeter -
+					ahead_node.merge_clearance - vehicle_length / 2.0 - min_safety_distance - 2.0 #m;
+				if (ahead_usable <= 0.0 #m and measured_speed < 1.5 #km/#h) {
+					measured_speed <- 0.0 #km/#h;
+					speed <- 0.0 #km/#h;
+					return;
+				}
 			}
 		}
 		point before_drive <- location;
@@ -1674,7 +1781,7 @@ species conflict_zone {
 	float last_exit_time <- -999.0;
 	list<base_vehicle_species> current_occupants <- [];
 
-	reflex monitor_encroachment {
+	reflex monitor_encroachment when: enable_surrogate_safety {
 		list<base_vehicle_species> present_vehicles <- (base_vehicle_species inside self.shape) where (each.final_target != nil and each.uses_signal and abs(each.surface_height()) < 2.5);
 
 		loop past_v over: current_occupants {

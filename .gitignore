@@ -7,6 +7,7 @@ env/
 
 # Python bytecode & cache
 __pycache__/
+.pytest_cache/
 *.py[cod]
 *$py.class
 *.so
@@ -35,6 +36,24 @@ dqn_py/run/
 .Rhistory
 *.bak
 Traffic/models/tmp_*.gaml
+
+# Independent Python research data and outputs
+python/data/
+python/results/
+python/*.egg-info/
+python/build/
+python/dist/
+/legacy_archives/python_sim_20261104/
+
+# Standalone GAMA UI runtime artifacts
+gama_ui/validation_results/
+gama_ui/TrafficUI/models/snapshots/
+gama_ui/TrafficUI/models/tmp_*.gaml
+
+# Historical coupled pipeline runtime artifacts
+legacy/gama_training/dqn_py/venv/
+legacy/gama_training/dqn_py/run/
+legacy/gama_training/comparison_results/
 
 # Local presentation material and research papers
 seminar/

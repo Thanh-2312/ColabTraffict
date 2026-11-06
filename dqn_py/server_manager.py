@@ -33,12 +33,16 @@ class GamaServerManager:
     """Quan ly subprocess cua gama-server."""
 
     def __init__(self, port=6868, gama_headless=GAMA_HEADLESS,
-                 workdir=None, log_file=None, startup_timeout=300.0):
+                 workdir=None, log_file=None, startup_timeout=300.0,
+                 heap_mb=None):
         self.port = int(port)
         self.gama_headless = gama_headless
         self.workdir = workdir or os.path.join(RUN_DIR, "server_ws")
         self.log_file = log_file or os.path.join(RUN_DIR, "gama_server.log")
         self.startup_timeout = float(startup_timeout)
+        self.heap_mb = int(heap_mb if heap_mb is not None else os.environ.get("GAMA_HEAP_MB", "2048"))
+        if self.heap_mb < 512:
+            raise ValueError("GAMA heap must be at least 512 MB")
         self.process = None
         self._log_fh = None
         os.makedirs(self.workdir, exist_ok=True)
@@ -78,12 +82,17 @@ class GamaServerManager:
         configuration = os.path.join(self.workdir, "configuration")
         workspace = os.path.join(self.workdir, "workspace")
         os.makedirs(workspace, exist_ok=True)
-        cmd = ["bash", self.gama_headless, "-socket", str(self.port),
+        cmd = ["bash", self.gama_headless, "-m", f"{self.heap_mb}m", "-socket", str(self.port),
                "-configuration", configuration, "-data", workspace]
+        server_env = {
+            **os.environ,
+            "_JAVA_OPTIONS": os.environ.get("_JAVA_OPTIONS", "") + " -Xms256m -XX:-AlwaysPreTouch",
+        }
         print(f"[GamaServer] Dang khoi dong: {' '.join(cmd)}  (workdir={self.workdir})")
-        print(f"[GamaServer] Log: {self.log_file}  (khoi dong GAMA mat ~30-90s)")
+        print(f"[GamaServer] Log: {self.log_file}  (heap={self.heap_mb}MB, AlwaysPreTouch=off)")
         self.process = subprocess.Popen(
             cmd, cwd=self.workdir, stdout=self._log_fh, stderr=subprocess.STDOUT, start_new_session=True,
+            env=server_env,
         )
 
         t0 = time.time()

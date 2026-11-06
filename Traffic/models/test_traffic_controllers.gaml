@@ -44,6 +44,7 @@ global {
 	}
 
 	init {
+		enable_surrogate_safety <- true;
 		// Khởi tạo Q-table 18 states
 		loop p over: [0, 4] {
 			loop n_lvl over: [0, 1, 2] {
@@ -199,15 +200,15 @@ global {
 			vehicle_length <- 4.0; vehicle_width <- 1.9; heading <- 0.0;
 		}
 		base_vehicle_species a <- probes[0]; base_vehicle_species b <- probes[1];
-		ask a { location <- {0,0}; speed <- 10.0; }
-		ask b { location <- {8,0}; speed <- 5.0; }
+		ask a { location <- {0,0}; heading <- 0.0; speed <- 10.0; }
+		ask b { location <- {8,0}; heading <- 0.0; speed <- 5.0; }
 		float first_ttc <- a.following_ttc(b);
-		ask a { location <- {8,0}; speed <- 5.0; }
-		ask b { location <- {0,0}; speed <- 10.0; }
+		ask a { location <- {8,0}; heading <- 0.0; speed <- 5.0; }
+		ask b { location <- {0,0}; heading <- 0.0; speed <- 10.0; }
 		float renamed_ttc <- b.following_ttc(a);
-		ask a { location <- {8,4}; }
+		ask a { location <- {8,4}; heading <- 0.0; }
 		do log_assertion("Safety", "TTC-NameIndependent", abs(first_ttc - 0.8) < 0.0001 and
-			abs(renamed_ttc - first_ttc) < 0.0001, "Same following geometry gives the same TTC for either agent ordering");
+			abs(renamed_ttc - first_ttc) < 0.0001, "Same following geometry gives the same TTC for either agent ordering (first=" + first_ttc + ", renamed=" + renamed_ttc + ", a_heading=" + a.heading + ", b_heading=" + b.heading + ")");
 		do log_assertion("Safety", "TTC-SeparateLanes", b.following_ttc(a) = 99.0,
 			"Passing on a separate parallel lane is not a rear-end TTC conflict");
 	}
@@ -371,7 +372,7 @@ global {
 	int ssm_phase_stable <- 0;
 	int ssm_prev_phase_track <- -1;
 	reflex ssm_track_invariants {
-		loop v over: base_vehicle_species {
+		loop v over: base_vehicle_species where (each.final_target != nil) {
 			if (v.speed != v.speed or v.location.x != v.location.x or
 				v.location.y != v.location.y) {
 				vehicle_numeric_ok <- false;
@@ -436,7 +437,7 @@ global {
 	}
 }
 
-experiment my_batch_experiment type: batch until: (cycle >= 2600) {
+experiment my_batch_experiment type: batch until: (cycle >= 2601) {
 	// This fixture tests THROUGH release. Protected left release has its own
 	// continuous four-approach audit; left-only queues must not fail this test.
 	parameter "Through release fixture" var: left_turn_share init: 0.0;

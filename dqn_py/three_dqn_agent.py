@@ -45,8 +45,9 @@ def unpack_states(packed):
 
 
 class ReplayBuffer:
-    def __init__(self, capacity=1_000_000):
+    def __init__(self, capacity=1_000_000, seed=None):
         self.capacity = int(capacity)
+        self.rng = np.random.default_rng(seed)
         self.states = np.empty((capacity, PACKED_SIZE), dtype=np.uint8)
         self.next_states = np.empty((capacity, PACKED_SIZE), dtype=np.uint8)
         self.actions = np.empty(capacity, dtype=np.uint8)
@@ -72,7 +73,7 @@ class ReplayBuffer:
         self.size = min(self.size + 1, self.capacity)
 
     def sample(self, batch_size):
-        idx = np.random.randint(self.size, size=batch_size)
+        idx = self.rng.integers(self.size, size=batch_size)
         return (unpack_states(self.states[idx]), self.actions[idx].astype(np.int64),
                 self.rewards[idx], unpack_states(self.next_states[idx]),
                 self.dones[idx].astype(np.float32), self.discounts[idx], self.next_masks[idx])
@@ -102,22 +103,37 @@ class DuelingQNetwork(nn.Module):
         return self.value(h) + advantage - advantage.mean(dim=1, keepdim=True)
 
 
+class FlatQNetwork(nn.Module):
+    """Four-action DQN baseline using the same DTSE without convolution/dueling."""
+
+    def __init__(self):
+        super().__init__()
+        self.net = nn.Sequential(nn.Flatten(), nn.Linear(480, 128), nn.ReLU(),
+                                 nn.Linear(128, 64), nn.ReLU(), nn.Linear(64, N_ACTIONS))
+
+    def forward(self, x):
+        return self.net(x)
+
+
 class ThreeDQNAgent:
     def __init__(self, lr=1e-4, gamma=0.99, buffer_size=1_000_000,
                  warmup=100_000, batch_size=32, tau=1e-3,
                  eps_start=1.0, eps_min=0.001, eps_decay_steps=2_000_000,
-                 seed=None, device=None, reward_mode="reference"):
-        if reward_mode not in ("reference", "queue_time"):
+                 seed=None, device=None, reward_mode="reference",
+                 network_factory=DuelingQNetwork, architecture=ARCHITECTURE,
+                 double_dqn=True):
+        if reward_mode not in ("reference", "queue_time", "total_wait"):
             raise ValueError(f"Unknown reward mode: {reward_mode}")
         if seed is not None:
-            random.seed(seed)
-            np.random.seed(seed % (2 ** 32))
             torch.manual_seed(seed)
+        self.rng = random.Random(seed)
         self.device = device or torch.device(
             "mps" if torch.backends.mps.is_available()
             else ("cuda" if torch.cuda.is_available() else "cpu"))
         self.gamma = float(gamma)
         self.reward_mode = reward_mode
+        self.architecture = architecture
+        self.double_dqn = bool(double_dqn)
         self.batch_size = int(batch_size)
         self.warmup = int(warmup)
         self.tau = float(tau)
@@ -126,20 +142,20 @@ class ThreeDQNAgent:
         self.eps_decay_steps = float(eps_decay_steps)
         self.decisions = 0
         self.eps = self.eps_start
-        self.online_net = DuelingQNetwork().to(self.device)
-        self.target_net = DuelingQNetwork().to(self.device)
+        self.online_net = network_factory().to(self.device)
+        self.target_net = network_factory().to(self.device)
         self.target_net.load_state_dict(self.online_net.state_dict())
         self.target_net.eval()
         self.optimizer = torch.optim.Adam(self.online_net.parameters(), lr=lr)
         self.loss_fn = nn.SmoothL1Loss()
-        self.buffer = ReplayBuffer(buffer_size)
+        self.buffer = ReplayBuffer(buffer_size, seed=seed)
         self.update_count = 0
         self.last_losses = deque(maxlen=100)
 
     def act(self, state, greedy=False, action_mask=None, force_random=False):
         mask = valid_mask(action_mask)
-        if force_random or (not greedy and random.random() < self.eps):
-            return int(random.choice(np.flatnonzero(mask)))
+        if force_random or (not greedy and self.rng.random() < self.eps):
+            return int(self.rng.choice(np.flatnonzero(mask).tolist()))
         with torch.no_grad():
             x = torch.as_tensor(np.asarray(state)[None], dtype=torch.float32,
                                 device=self.device)
@@ -153,7 +169,7 @@ class ThreeDQNAgent:
                        self.eps_start * math.exp(-self.decisions / self.eps_decay_steps))
 
     def store(self, state, action, reward, next_state, done, seconds=None, next_mask=None):
-        if self.reward_mode == "queue_time":
+        if self.reward_mode in ("queue_time", "total_wait"):
             if seconds is None or not math.isfinite(seconds) or seconds <= 0:
                 raise ValueError("queue_time learning requires the actual positive transition duration")
             discount = self.gamma ** (seconds / 5.0)
@@ -175,8 +191,11 @@ class ThreeDQNAgent:
         masks = torch.as_tensor(next_masks, device=self.device)
         q = self.online_net(s).gather(1, a).squeeze(1)
         with torch.no_grad():
-            best_actions = self.online_net(s2).masked_fill(~masks, -torch.inf).argmax(dim=1, keepdim=True)
-            next_q = self.target_net(s2).gather(1, best_actions).squeeze(1)
+            if self.double_dqn:
+                best_actions = self.online_net(s2).masked_fill(~masks, -torch.inf).argmax(dim=1, keepdim=True)
+                next_q = self.target_net(s2).gather(1, best_actions).squeeze(1)
+            else:
+                next_q = self.target_net(s2).masked_fill(~masks, -torch.inf).max(dim=1).values
             target = r + discount * (1.0 - d) * next_q
         loss = self.loss_fn(q, target)
         self.optimizer.zero_grad()
@@ -202,11 +221,12 @@ class ThreeDQNAgent:
                     "eps": self.eps, "decisions": self.decisions,
                     "update_count": self.update_count,
                     "gamma": self.gamma, "reward_mode": self.reward_mode,
-                    "architecture": ARCHITECTURE}, path)
+                    "architecture": self.architecture,
+                    "double_dqn": self.double_dqn}, path)
 
     def load(self, path):
         ckpt = torch.load(path, map_location=self.device, weights_only=False)
-        if ckpt.get("architecture") != ARCHITECTURE:
+        if ckpt.get("architecture") != self.architecture:
             raise ValueError("Checkpoint uses an older DTSE/control contract; retrain with the current GAMA model")
         self.gamma = ckpt["gamma"]
         self.reward_mode = ckpt["reward_mode"]
@@ -216,3 +236,54 @@ class ThreeDQNAgent:
         self.decisions = ckpt["decisions"]
         self.update_count = ckpt["update_count"]
         return ckpt
+
+    def training_state(self):
+        """Full state needed to resume off-policy learning without replay loss."""
+        replay = self.buffer
+        return {
+            "policy": {"online": self.online_net.state_dict(),
+                       "target": self.target_net.state_dict()},
+            "optimizer": self.optimizer.state_dict(),
+            "architecture": self.architecture,
+            "eps": self.eps, "decisions": self.decisions,
+            "update_count": self.update_count,
+            "losses": list(self.last_losses),
+            "action_rng": self.rng.getstate(),
+            "replay_rng": replay.rng.bit_generator.state,
+            "replay": {"capacity": replay.capacity, "size": replay.size,
+                       "pos": replay.pos,
+                       **{name: getattr(replay, name)[:replay.size]
+                          for name in ("states", "next_states", "actions",
+                                       "rewards", "dones", "discounts", "next_masks")}},
+        }
+
+    def restore_training(self, state):
+        if state["architecture"] != self.architecture:
+            raise ValueError("Training checkpoint architecture mismatch")
+        replay_state = state["replay"]
+        if replay_state["capacity"] != self.buffer.capacity:
+            raise ValueError("Training checkpoint replay capacity mismatch")
+        self.online_net.load_state_dict(state["policy"]["online"])
+        self.target_net.load_state_dict(state["policy"]["target"])
+        self.optimizer.load_state_dict(state["optimizer"])
+        self.eps = state["eps"]
+        self.decisions = state["decisions"]
+        self.update_count = state["update_count"]
+        self.last_losses.clear()
+        self.last_losses.extend(state["losses"])
+        self.rng.setstate(state["action_rng"])
+        self.buffer.rng.bit_generator.state = state["replay_rng"]
+        self.buffer.size = replay_state["size"]
+        self.buffer.pos = replay_state["pos"]
+        for name in ("states", "next_states", "actions", "rewards",
+                     "dones", "discounts", "next_masks"):
+            getattr(self.buffer, name)[:self.buffer.size] = replay_state[name]
+
+
+class FlatDQNAgent(ThreeDQNAgent):
+    """Replay/target DQN with the same four legal phases and DTSE input."""
+
+    def __init__(self, **kwargs):
+        super().__init__(network_factory=FlatQNetwork,
+                         architecture="gama-four-phase-flat-dqn-v1",
+                         double_dqn=False, **kwargs)

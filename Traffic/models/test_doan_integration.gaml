@@ -22,8 +22,10 @@ global {
 	bool audit_force_merge_stall <- false;
 	bool audit_force_overtaken_owner <- false;
 	base_vehicle_species audit_overtaken_front <- nil;
+	base_vehicle_species audit_overtaken_rear <- nil;
 	intersection audit_overtaken_merge <- nil;
 	int audit_overtaken_injected_cycle <- -1;
+	bool audit_overtaken_released <- false;
 	bool audit_overtaken_reassigned <- false;
 	base_vehicle_species audit_frozen_owner <- nil;
 	intersection audit_frozen_merge <- nil;
@@ -121,7 +123,8 @@ global {
 	}
 
 	// Reproduce a reservation left on a vehicle behind the first car in its
-	// lane. The front car must receive the slot at the next arbitration.
+	// lane. The stale rear slot must be released at the next arbitration; the
+	// front car may still wait for a legitimate vehicle on the merging ramp.
 	reflex force_overtaken_owner when: audit_force_overtaken_owner and cycle > 650 and
 		audit_overtaken_injected_cycle < 0 {
 		loop merge over: intersection where (each.node_key = "F_NS1" or each.node_key = "F_SN1") {
@@ -140,6 +143,7 @@ global {
 					base_vehicle_species rear <- rears with_min_of each.distance_to_current_target;
 					ask merge { merge_owners <- [rear]; }
 					audit_overtaken_front <- front;
+					audit_overtaken_rear <- rear;
 					audit_overtaken_merge <- merge;
 					audit_overtaken_injected_cycle <- cycle;
 					write "DOAN_OVERTAKEN_INJECTED," + cycle + "," + merge.node_key + "," + front.name + "," + rear.name;
@@ -151,6 +155,11 @@ global {
 
 	reflex observe_overtaken_owner when: audit_force_overtaken_owner and
 		audit_overtaken_injected_cycle >= 0 and !audit_overtaken_reassigned {
+		if (!audit_overtaken_released and
+			!(audit_overtaken_merge.merge_owners contains audit_overtaken_rear)) {
+			audit_overtaken_released <- true;
+			write "DOAN_OVERTAKEN_RELEASED," + cycle + "," + audit_overtaken_rear.name;
+		}
 		if (audit_overtaken_merge.merge_owners contains audit_overtaken_front) {
 			audit_overtaken_reassigned <- true;
 			write "DOAN_OVERTAKEN_REASSIGNED," + cycle + "," + audit_overtaken_front.name;
@@ -277,18 +286,33 @@ global {
 							if (gap < 3 or (w.speed > v.speed and gap / (w.speed - v.speed) < 1.5)) { audit_unsafe_merges <- audit_unsafe_merges + 1; }
 						}
 					}
-					if (v.next_road != nil and w.current_road = road(v.next_road)) {
-						bool shared_next <- w.lowest_lane < v.lowest_lane + v.num_lanes_occupied and
-							w.lowest_lane + w.num_lanes_occupied > v.lowest_lane;
-						float next_progress <- road(v.next_road).shape.perimeter - w.distance_to_current_target;
-						float route_gap <- v.distance_to_current_target + next_progress -
-							(v.vehicle_length + w.vehicle_length) / 2.0;
-						if (shared_next and route_gap >= 0.0 #m and route_gap < nearest_leader_gap) {
-							nearest_leader_gap <- route_gap;
-							nearest_leader_speed <- w.measured_speed;
-							nearest_leader_name <- w.name;
+					if (v.next_road != nil) {
+						list<road> lookahead_roads <- [road(v.next_road)];
+						if (road(v.next_road).shape.perimeter < 30.0 #m) {
+							intersection mid_node <- intersection(road(v.next_road).target_node);
+							road edge_after <- first(mid_node.roads_out where (road(each).road_kind = "ground" and road(each).is_incoming));
+							if (edge_after != nil) {
+								lookahead_roads <- lookahead_roads + edge_after;
+							}
 						}
-						if (shared_next and route_gap > -1.0 #m and route_gap < 35 #m) { blocked <- true; }
+						loop next_r over: lookahead_roads {
+							if (w.current_road = next_r) {
+								bool shared_next <- w.lowest_lane < v.lowest_lane + v.num_lanes_occupied and
+									w.lowest_lane + w.num_lanes_occupied > v.lowest_lane;
+								float dist_to_r <- next_r = road(v.next_road) ?
+									v.distance_to_current_target :
+									v.distance_to_current_target + road(v.next_road).shape.perimeter;
+								float next_progress <- next_r.shape.perimeter - w.distance_to_current_target;
+								float route_gap <- dist_to_r + next_progress -
+									(v.vehicle_length + w.vehicle_length) / 2.0;
+								if (shared_next and route_gap >= 0.0 #m and route_gap < nearest_leader_gap) {
+									nearest_leader_gap <- route_gap;
+									nearest_leader_speed <- w.measured_speed;
+									nearest_leader_name <- w.name;
+								}
+								if (shared_next and route_gap > -1.0 #m and route_gap < 35 #m) { blocked <- true; }
+							}
+						}
 					}
 					if (v.name < w.name and distance_to(pos,w.compute_position()) < 13 and body_overlap(v,w)) {
 						audit_overlaps <- audit_overlaps + 1;

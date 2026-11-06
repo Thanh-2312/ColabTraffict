@@ -1,5 +1,11 @@
 # Traffic-Light-ABM
 
+> Hướng nghiên cứu hiện tại dùng GAMA làm môi trường mô phỏng chính. Xem [ý tưởng nghiên cứu giao thông hỗn hợp](Y_TUONG_NGHIEN_CUU_DQN_GIAO_THONG_HON_HOP.md) để review đầu vào 6 mặt phẳng, thí nghiệm bố cục xe và hai hướng Rainbow DQN / Max Pressure. Pipeline GAMA–Python bên dưới là nền tảng đã khôi phục từ lịch sử Git; đầu vào không gian mới chưa được nối vào GAMA.
+
+Nguyên mẫu mô phỏng Python/C++ độc lập đã được dọn khỏi cây làm việc. Mã nguồn, dữ liệu và kết quả cũ được giữ trong [kho lưu trữ](legacy_archives/README.md); môi trường ảo và bản build đã bỏ.
+
+[Kiểm tra GAMA sau cleanup](audits/gama_postcleanup_20261104/README.md): cả năm controller qua bài kiểm tra 1.500 tick, nhưng Fixed-Time và 3DQN còn lỗi ở lượt 4.000 tick. Không xem pipeline GAMA đã đạt kiểm chứng mô phỏng dài.
+
 Mô phỏng vi mô giao thông tại nút giao bốn nhánh bằng **GAMA Platform**, kèm năm bộ điều khiển đèn: Fixed-Time, MaxPressure, Q-Learning, Deep Q-Network (DQN) và Dueling Double DQN (3DQN). Mô hình gồm đường mặt đất, cầu vượt, hầm và các tuyến rẽ. Python và PyTorch được dùng để huấn luyện, đánh giá và chạy benchmark trên cùng lịch xe.
 
 ## Nội dung repository
@@ -38,20 +44,29 @@ Mở một trong các file sau, chọn experiment `my_experiment` rồi nhấn *
 
 Các experiment `my_batch_experiment` chạy mô phỏng không có giao diện. Trong GUI, màn hình `doan_3d` hiển thị cầu vượt, hầm và giao lộ; `intersection_view` hiển thị bản đồ 2D.
 
-## Huấn luyện và đánh giá 3DQN trên GAMA
+## Huấn luyện Q-learning, DQN và 3DQN trên cùng giao diện GAMA
 
-Để GAMA Server tự khởi động cùng lệnh, dùng `--start-server`:
+Ba thuật toán dùng cùng DTSE `3×8×20`, bốn action pha xanh, action mask, lịch yêu cầu xe theo seed và reward. Q-learning rời rạc hóa số xe dừng/đang tới theo bốn nhóm chuyển động; DQN dùng mạng phẳng; 3DQN dùng CNN, Double DQN và nhánh dueling. Đây là đường train bốn pha để so sánh ba thuật toán. Đầu vào sáu mặt phẳng trong [đề xuất nghiên cứu](Y_TUONG_NGHIEN_CUU_DQN_GIAO_THONG_HON_HOP.md) chưa được triển khai trong GAMA.
+
+Ví dụ huấn luyện với reward thời gian chờ của xe trong mạng **và** xe còn đợi phát ngoài mạng, cùng hai GAMA worker độc lập:
 
 ```bash
-dqn_py/venv/bin/python dqn_py/train.py --total-steps 5000000 --episode-horizon 8000 --start-server
-dqn_py/venv/bin/python dqn_py/evaluate.py --weights dqn_py/run/train_YYYYMMDD_HHMMSS/dqn_weights.pt --episodes 5 --start-server
+dqn_py/venv/bin/python dqn_py/train.py --algorithm qlearning --reward-mode total_wait --workers 2 --total-steps 1000000 --episode-horizon 8000 --start-server
+dqn_py/venv/bin/python dqn_py/train.py --algorithm dqn --reward-mode total_wait --workers 2 --total-steps 1000000 --episode-horizon 8000 --start-server
+dqn_py/venv/bin/python dqn_py/train.py --algorithm 3dqn --reward-mode total_wait --workers 2 --total-steps 1000000 --episode-horizon 8000 --start-server
 ```
 
-Kết quả huấn luyện được lưu trong `dqn_py/run/train_<timestamp>/`. `train.py` và `evaluate.py` dùng mô hình `Traffic/models/intersection-dqn-python.gaml` qua GAMA Server.
+Mặc định `--demand-mode paired` tạo một CSV lịch yêu cầu xe cho mỗi seed, dùng chung giữa ba thuật toán; xe chưa vào được mạng vẫn ở hàng đợi ngoài mạng. Có thể dùng `--demand-mode model` để phát xe trực tiếp trong GAMA, nhưng seed khi đó không bảo đảm lịch xe giống nhau giữa các chính sách. Mỗi worker chạy một GAMA Server trên CPU với Java heap tối đa 2 GB (`--gama-heap-mb`) và chỉ thu thập transition. Một learner cập nhật trên thiết bị PyTorch khả dụng (CUDA/MPS/CPU), nhận các episode theo thứ tự seed sau mỗi đợt thu thập. Reward `total_wait` là âm của gia số `(queue_time_integral + external_wait_integral)/50`, dùng discount theo thời gian thực giữa hai quyết định. `queue_time` chỉ tính xe đã vào mạng; `reference` dùng delay bình phương tốc độ theo bài báo. Với nhiều worker và reward `reference`, phải truyền cùng một `--max-delay-sq` cố định dương cho mọi worker; mặc định chạy một worker nếu muốn giữ chuẩn hóa cực đại chạy theo bài tham khảo. Việc tắt TTC/TIT/PET đã đo nhanh hơn nhưng làm thay đổi quỹ đạo cùng seed, nên đường train luôn bật các phép đo này.
+
+Kết quả ở `dqn_py/run/<algorithm>_<timestamp>/`: `best_weights.pt` chọn theo hai seed validation 10.000.001–10.000.002 mặc định mỗi 50 episode, `dqn_weights.pt` là policy cuối, `checkpoint.pt` và `training_state.pt` mặc định lưu mỗi 50 episode. `training_state.pt` gồm replay, optimizer, RNG và bộ chuẩn hóa reward để tiếp tục học. Có thể điều chỉnh `--validate-every` và `--checkpoint-every` theo chi phí thời gian/đĩa. Dùng `--resume-dir` trỏ tới thư mục này và tăng `--total-steps` hoặc `--episodes` để tiếp tục; script từ chối nếu cấu hình hay mã mô hình đã đổi. Đánh giá từng policy trên seed test riêng, mặc định bắt đầu từ 20.000.001:
+
+```bash
+dqn_py/venv/bin/python dqn_py/evaluate.py --weights /duong/dan/best_weights.pt --episodes 5 --start-server
+```
 
 Từ bản sửa 19/10/2026, mọi controller dùng vàng 3 giây, đỏ toàn phần tối thiểu 2 giây và chờ xe đã vào nút thoát ra. 3DQN có action mask: không gia hạn quá 60 giây khi hướng khác có xe, và ưu tiên pha có nhu cầu chưa được phục vụ trong 120 giây. Ngưỡng 120 giây kích hoạt ưu tiên ở quyết định tiếp theo, không phải cam kết giới hạn thời gian chờ khi nút đang bị chặn. Mask được dùng cho cả khám phá, greedy và Double DQN target. GUI preview phục vụ cả bốn pha.
 
-Trong mỗi ô DTSE, tốc độ là **trung bình của các xe**, không phụ thuộc thứ tự duyệt. Occupancy vẫn nhị phân theo nhóm chuyển động, nên chưa biểu diễn mật độ theo từng làn vật lý. Checkpoint 3DQN cũ `dtse-v1` không dùng trực tiếp với hợp đồng state/controller mới; cần huấn luyện lại. `best_weights.pt` được chọn trên hai seed validation 3001–3002 theo hàng đợi, không theo reward của episode train. Horizon là giới hạn thời gian: transition cuối bị cắt giữa action không được đưa vào replay; transition đầy đủ vẫn bootstrap, không coi giao thông là terminal khi đồng hồ hết giờ.
+Trong mỗi ô DTSE, tốc độ là **trung bình của các xe**, không phụ thuộc thứ tự duyệt. Occupancy vẫn nhị phân theo nhóm chuyển động, nên chưa biểu diễn mật độ theo từng làn vật lý. Checkpoint 3DQN cũ `dtse-v1` không dùng trực tiếp với hợp đồng state/controller mới; cần huấn luyện lại. `best_weights.pt` được chọn trên hai seed validation riêng theo thời gian chờ tích lũy; với `total_wait` phép chọn tính cả xe đợi ngoài mạng. Horizon là giới hạn thời gian: transition cuối bị cắt giữa action không được đưa vào replay; transition đầy đủ vẫn bootstrap, không coi giao thông là terminal khi đồng hồ hết giờ.
 
 Controller này chọn trực tiếp một trong bốn pha xanh: 0 NS đi thẳng, 1 NS rẽ trái, 2 EW đi thẳng, 3 EW rẽ trái. Xe rẽ phải và quay đầu dùng nhánh riêng, không nhận tín hiệu đèn trong topology GAMA. Chọn lại pha hiện tại kéo dài xanh 10 giây; đổi pha đi qua vàng 3 giây và đỏ toàn phần **tối thiểu** 2 giây, kéo dài đến khi xe đang qua nút đã thoát, rồi mới mở xanh tối thiểu 10 giây. State DTSE có kích thước `3×8×20`: occupancy, tốc độ chia cho 50 km/h, và pha xanh; 8 hàng là bốn hướng E/N/W/S nhân hai nhóm đi thẳng/rẽ trái, mỗi ô cách vạch dừng 8 m trong vùng 160 m. Reward dùng tổng squared delay của bài tham khảo: `clip(1 - D_t/max(D_1..D_t), 0, 1)`, với `D_t = sum(1 - (v/50)^2)` trên **mọi xe có tín hiệu thuộc đường vào nút giao**, kể cả ngoài vùng DTSE; mốc `max` được cập nhật theo lịch sử và giữ xuyên các episode. Đầu vào vẫn là DTSE thích nghi cho hình học GAMA; action 4 pha, mạng CNN/dueling và các siêu tham số chính theo bài báo. Epsilon bắt đầu ở 1, giảm hàm mũ theo thang 2 triệu quyết định tới sàn 0.001; 100.000 transition warm-up đầu được lấy ngẫu nhiên từ các action hợp lệ trước khi cập nhật gradient. Bài báo Đà Nẵng ghi epsilon 0.001 là giá trị ban đầu, trong khi công thức và nghiên cứu nguồn được trích dẫn mô tả epsilon tối thiểu; ở đây chọn cách đặt 0.001 làm sàn để vẫn có giai đoạn khám phá. Mặc định replay 1 triệu transition, Adam `1e-4`, Huber, `γ=0.99`, soft target `τ=0.001`. Có thể giảm `--buffer-size`, `--warmup`, `--total-steps` để kiểm tra nhanh. Một lượt chạy `--total-steps 5000000` lưu cả checkpoint 1M và 5M; chạy riêng lệnh 1M rồi 5M sẽ bắt đầu lại từ đầu. Số step ở đây là quyết định của agent, không phải chu kỳ 0,1 giây của GAMA.
 
@@ -67,7 +82,7 @@ python3 scripts/demo_dqn.py --weights /duong/dan/best_dqn.pt
 
 Giữ terminal đang chạy, mở `Traffic/models/intersection-dqn-demo.gaml` trong GAMA Studio, chọn `my_experiment` rồi nhấn **Run**. Nhấn `Ctrl+C` ở terminal để dừng demo. Demo GUI phát xe trực tiếp; số liệu benchmark dùng lịch xe cố định nên không tái tạo bằng cách chạy GUI.
 
-## Benchmark bốn bộ điều khiển
+## Benchmark hai action lịch sử
 
 ```bash
 dqn_py/venv/bin/python scripts/fair_benchmark.py \
@@ -76,7 +91,7 @@ dqn_py/venv/bin/python scripts/fair_benchmark.py \
   --horizon 8000 --workers 4 --start-server --port 6876
 ```
 
-Pipeline huấn luyện và so sánh Fixed-Time, MaxPressure, Q-Learning và DQN với cùng lịch yêu cầu xe. Kết quả gồm `report.md`, `comparison.png`, `summary.csv`, `per_run_metrics.csv`, checkpoint và log từng lượt. Có thể dùng `--workers 1` để giảm tài nguyên; dùng `--resume` với cùng cấu hình để tiếp tục lượt bị gián đoạn. `--smoke --horizon 1000` chạy kiểm tra nhanh trong một thư mục output mới.
+Pipeline này huấn luyện và so sánh Fixed-Time, MaxPressure, Q-Learning và DQN với cùng lịch yêu cầu xe nhưng chỉ có action **giữ/đổi pha đi thẳng**; pha rẽ trái chạy theo lịch cố định. Vì vậy không dùng kết quả này như đối chứng thuật toán trực tiếp với đường train bốn action ở trên. Kết quả gồm `report.md`, `comparison.png`, `summary.csv`, `per_run_metrics.csv`, checkpoint và log từng lượt. Có thể dùng `--workers 1` để giảm tài nguyên; dùng `--resume` với cùng cấu hình để tiếp tục lượt bị gián đoạn. `--smoke --horizon 1000` chạy kiểm tra nhanh trong một thư mục output mới.
 
 `scripts/compare_4_models.py` chạy các model GAML riêng để kiểm tra bản demo; kết quả đó không thay thế benchmark chính sách đã huấn luyện ở trên.
 
@@ -93,20 +108,20 @@ dqn_py/venv/bin/python scripts/benchmark_3dqn_vs_4.py \
 
 Script huấn luyện 3DQN trên cùng 40 seed huấn luyện và đánh giá cả năm chính sách trên cùng năm seed kiểm tra, 8.000 chu kỳ/seed. Bốn chính sách cũ chạy qua `intersection-dqn-legacy.gaml` để giữ đúng action 0/1; 3DQN dùng mô hình bốn action. Warm-up mặc định của benchmark là 64 transition, replay 20.000 và bốn cập nhật mỗi transition. Epsilon thăm dò giảm theo hàm mũ sau mỗi transition; lượt kiểm tra dùng epsilon 0. Checkpoint được chọn theo hàng đợi trung bình trên hai seed validation sau mỗi 10 episode, cùng quy tắc với baseline. Đây là cấu hình so sánh theo ngân sách 40 tập, khác cấu hình 100.000 warm-up của huấn luyện 3DQN đầy đủ. Kết quả có `report.md`, `per_run_metrics.csv`, checkpoint, log từng lượt và `manifest.json`; dùng `--resume` với cùng cấu hình để tiếp tục lượt bị gián đoạn. Nếu các model GAMA baseline và dữ liệu nhu cầu không đổi, có thể thêm `--reuse-baselines /duong/dan/benchmark-cu` để dùng lại kết quả đánh giá bốn baseline sau khi đối chiếu hash.
 
-Q-Learning và DQN trong benchmark là hai learner Python dùng chung transition của 40 episode; mỗi learner điều khiển 20 episode khi thu thập dữ liệu. Các model GAML `intersection-qlearning.gaml` và `intersection-dqn-python.gaml` là đường chạy demo/3DQN riêng, không phải checkpoint Q-Learning/DQN Python đã đánh giá trong benchmark. Lệnh `dqn_py/train.py` cũng dùng luồng xe do GAMA sinh theo seed; benchmark dùng CSV nhu cầu xe cố định.
+Q-Learning và DQN trong benchmark là hai learner Python dùng chung transition của 40 episode; mỗi learner điều khiển 20 episode khi thu thập dữ liệu. Các model GAML `intersection-qlearning.gaml` và `intersection-dqn-python.gaml` là đường chạy demo/3DQN riêng, không phải checkpoint Q-Learning/DQN Python đã đánh giá trong benchmark. `dqn_py/train.py` mặc định tạo CSV nhu cầu cố định cùng cách như benchmark, nhưng dùng giao diện bốn action.
 
 Benchmark mới mặc định `--reward-mode queue_time`: reward âm của thời gian xe dừng tích lũy giữa hai quyết định chia 50, discount `0.97 ** (dt_seconds / 5)`, cùng mục tiêu với Q-Learning và DQN. Reward này tính cả thời gian vàng/đỏ và là lựa chọn thích nghi GAMA, **khác reward bài báo**. Dùng `--reward-mode reference --reward-scope all` để giữ công thức delay bình phương tốc độ của repo; `--reward-scope near` là ablation chỉ tính vùng DTSE 160 m. `train.py` độc lập vẫn mặc định `reference`; có thể truyền `--reward-mode queue_time`.
 
 Phải chạy lại `fair_benchmark.py` trên phiên bản hiện tại trước khi so sánh. Script từ chối baseline huấn luyện bằng code/môi trường khác; cache kiểm tra hash policy/checkpoint, source Python/GAMA, demand và cấu hình reward. `--resume` còn đối chiếu agent seed và toàn bộ CSV train/validation/test. Q-learning GAML chạy online đã đổi sang reward tích lũy theo thời gian, discount theo khoảng quyết định, state có tuổi pha và bootstrap chỉ action đổi pha tại giới hạn xanh; đây vẫn là một demo online, không phải bảng Q của benchmark Python.
 
-[Kiểm toán năm phương pháp](comparison_results/audit_5_methods_20261018/findings.md) và `benchmark_3dqn_clearance_20261018` là dữ liệu lịch sử trước bản sửa 19/10/2026, không đại diện cho code hiện tại. Chỉ số TTC hiện là sự kiện đuổi gần trên quỹ đạo cùng làn, tính độc lập với tên xe; phanh gấp được đếm khi bắt đầu một đợt phanh. PET tiếp tục đo xung đột cắt nhau. Các bộ đếm an toàn cũ theo tick không so trực tiếp với bộ đếm sự kiện mới.
+Các kiểm toán năm phương pháp và benchmark clearance trước bản sửa 19/10/2026 là dữ liệu lịch sử, không đại diện cho code hiện tại. Chỉ số TTC hiện là sự kiện đuổi gần trên quỹ đạo cùng làn, tính độc lập với tên xe; phanh gấp được đếm khi bắt đầu một đợt phanh. PET tiếp tục đo xung đột cắt nhau. Các bộ đếm an toàn cũ theo tick không so trực tiếp với bộ đếm sự kiện mới.
 
 ## Kiểm thử
 
 ```bash
 python3 scripts/run_doan_integration_suite.py
 python3 scripts/run_test_suite.py
-dqn_py/venv/bin/python -m unittest scripts.test_fair_benchmark scripts.test_learning_pipeline dqn_py.test_three_dqn_agent dqn_py.test_gama_env_schedule dqn_py.test_server_manager_cleanup
+dqn_py/venv/bin/python -m unittest dqn_py.test_demand scripts.test_fair_benchmark scripts.test_learning_pipeline dqn_py.test_three_dqn_agent dqn_py.test_four_phase_agents dqn_py.test_gama_env_schedule dqn_py.test_server_manager_cleanup
 ```
 
 Các kiểm thử tích hợp GAMA cần GAMA Headless và có thể mất thời gian. Kết quả và log được ghi vào `comparison_results/`.

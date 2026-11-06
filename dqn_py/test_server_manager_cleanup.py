@@ -16,9 +16,12 @@ class ServerCleanupTest(unittest.TestCase):
         with socket.socket() as probe:
             try:
                 probe.bind(('127.0.0.1', 0))
-            except PermissionError as error:
-                self.skipTest(f'local socket binding is unavailable: {error}')
-            port = probe.getsockname()[1]
+                probe.listen(1)
+                port = probe.getsockname()[1]
+                with socket.create_connection(('127.0.0.1', port), timeout=0.2):
+                    pass
+            except (PermissionError, OSError) as error:
+                self.skipTest(f'local socket loopback is unavailable: {error}')
         with tempfile.TemporaryDirectory() as tmp:
             root = Path(tmp)
             (root / 'listener.py').write_text(

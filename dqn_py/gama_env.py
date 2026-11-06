@@ -51,6 +51,12 @@ STATE_PACK_EXPR = (
     + ' + "|" + next_decision_in_cycles'
 )
 
+# One expression after capture_dtse replaces four WebSocket round trips at
+# every decision. The DTSE list never contains the delimiter.
+DTSE_PACK_EXPR = ('"" + dtse_pack + "|" + dtse_delay_sq + "|" + '
+                  'dtse_delay_sq_near + "|" + queue_time_integral + "|" + '
+                  'external_wait_integral + "|" + dqn_action_mask')
+
 STATE_FIELDS = [
     "cycle", "global_phase", "green_cycles", "yellow_cycles",
     "queue_ns", "queue_ew", "approach_ns", "approach_ew",
@@ -90,7 +96,7 @@ class GamaTrafficEnv:
                  reward_mode="reference", max_delay_sq=None):
         if reward_scope not in ("all", "near"):
             raise ValueError(f"Unknown reward scope: {reward_scope}")
-        if reward_mode not in ("reference", "queue_time"):
+        if reward_mode not in ("reference", "queue_time", "total_wait"):
             raise ValueError(f"Unknown reward mode: {reward_mode}")
         self.max_delay_sq = float(max_delay_sq) if max_delay_sq is not None else None
         self.host = host
@@ -204,23 +210,25 @@ class GamaTrafficEnv:
                 self.exp_id, "capture_dtse", "{}", "world.0", timeout=self.timeout)
             if resp.get("type") != "CommandExecutedSuccessfully":
                 raise GamaEnvError(f"capture_dtse failed: {resp}")
-            raw_dtse = str(await self._exec_expression("dtse_pack"))
+            packed = str(await self._exec_expression(DTSE_PACK_EXPR)).rsplit("|", 5)
+            if len(packed) != 6:
+                raise GamaEnvError("Invalid DTSE metrics payload")
+            raw_dtse, delay_all, delay_near, queue_integral, external_integral, raw_mask = packed
             values = np.asarray([float(x) for x in re.findall(
                 r"[-+]?(?:\d*\.\d+|\d+\.?\d*)(?:[eE][-+]?\d+)?", raw_dtse
             )], dtype=np.float32)
             if values.size != 480:
                 raise GamaEnvError(f"DTSE has {values.size} values; expected 480")
             state["dtse"] = values.reshape(3, 8, 20)
-            delay_field = ("dtse_delay_sq" if self.reward_scope == "all"
-                           else "dtse_delay_sq_near")
-            state["delay_sq"] = float(await self._exec_expression(delay_field))
-            state["queue_time_integral"] = float(await self._exec_expression("queue_time_integral"))
-            raw_mask = str(await self._exec_expression("'' + dqn_action_mask"))
+            state["delay_sq"] = float(delay_all if self.reward_scope == "all" else delay_near)
+            state["queue_time_integral"] = float(queue_integral)
+            state["external_wait_integral"] = float(external_integral)
             state["action_mask"] = np.asarray(
                 [int(x) for x in re.findall(r"\d+", raw_mask)], dtype=np.bool_)
             if state["action_mask"].shape != (4,) or not state["action_mask"].any():
                 raise GamaEnvError(f"Invalid action mask: {raw_mask}")
-            if not np.isfinite(values).all() or not np.isfinite(state["delay_sq"]):
+            if not np.isfinite(values).all() or not all(np.isfinite(state[name]) for name in
+                ("delay_sq", "queue_time_integral", "external_wait_integral")):
                 raise GamaEnvError("Non-finite DTSE or reward input")
         return state
 
@@ -243,12 +251,12 @@ class GamaTrafficEnv:
             raise GamaEnvError(f"ask set_dqn_action failed: {resp}")
 
     async def step_cycles(self, n):
-        """Run n cycles in short synchronous batches and check each response."""
+        """Run n cycles in bounded synchronous batches and check each response."""
         remaining = int(n)
         if remaining < 0:
             raise ValueError(f"Cycle count must be non-negative: {n}")
         while remaining:
-            chunk = min(100, remaining)
+            chunk = min(500, remaining)
             resp = await self.client.step_awaitable(
                 self.exp_id, chunk, sync=True, timeout=self.timeout)
             if resp.get("type") != "CommandExecutedSuccessfully":
@@ -270,6 +278,9 @@ class GamaTrafficEnv:
     def transition_reward(self, previous, current):
         if self.reward_mode == "queue_time":
             return -(current["queue_time_integral"] - previous["queue_time_integral"]) / 50.0
+        if self.reward_mode == "total_wait":
+            return -((current["queue_time_integral"] - previous["queue_time_integral"]) +
+                     (current["external_wait_integral"] - previous["external_wait_integral"])) / 50.0
         return self.reward_from_state(current)
 
     # -------------------------------------------------------------- gym API
@@ -298,16 +309,20 @@ class GamaTrafficEnv:
         state = await self.read_state()
         if state["cycle"] != 0:
             raise GamaEnvError(f"Reset did not start at cycle 0: {state['cycle']}")
+        if seed is not None:
+            applied_seed = float(await self._exec_expression("world.seed"))
+            if applied_seed != int(seed):
+                raise GamaEnvError(f"GAMA applied seed {applied_seed}, expected {int(seed)}")
         return state
 
-    async def step(self, action, horizon=None):
+    async def step(self, action, horizon=None, current_state=None):
         """
         Thuc hien 1 buong quyet dinh DQN (protocol handshake day du).
         Optional horizon truncates exactly, including during junction clearance.
         A truncated state is not a terminal traffic state. Only decision states
         are valid bootstrap states for this action interface.
         """
-        current_state = await self.read_state()
+        current_state = current_state if current_state is not None else await self.read_state()
         if action not in range(self.action_count):
             raise GamaEnvError(f"Action khong hop le: {action}")
         if not current_state["dqn_waiting_action"]:

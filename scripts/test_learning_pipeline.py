@@ -93,6 +93,14 @@ class PipelineTest(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(count, 39)
         self.assertEqual([r['cycle'] for r in writer.rows], list(range(10, 400, 10)))
 
+    async def test_validation_skips_unneeded_sample_reads(self):
+        env, writer = ClearanceEnv(), SampleWriter()
+        state, reward, decisions, count = await evaluate_episode(
+            env, self.agent(), 5001, 400, writer, 1, collect_samples=False)
+        self.assertEqual((state['cycle'], decisions, count), (400, 2, 0))
+        self.assertEqual(writer.rows, [])
+        self.assertAlmostEqual(reward, -1.2)
+
     async def test_all_learners_drop_partial_action_instead_of_false_terminal(self):
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)
