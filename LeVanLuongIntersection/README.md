@@ -39,8 +39,22 @@ python scripts/build_layout.py
 
 Script in bảng sublane và ghi lại `includes/roads.geojson`, `includes/areas.geojson` (UTM 48N, mét).
 
+## Train RL (Rainbow / 3DQN + Max Pressure)
+
+Experiment `dqn_server_experiment` dùng cùng giao thức với `Traffic/models/intersection-dqn-python.gaml`, chỉ có state spatial nên chỉ dùng được `--algorithm rainbow` hoặc `hybrid`:
+
+```bash
+python dqn_py/train.py --algorithm hybrid --site lvl --reward-mode r1 --workers 4 --start-server
+python dqn_py/evaluate.py --site lvl --weights <run>/best_weights.pt --episodes 5 --start-server
+```
+
+- Slot E, N, W, S của state = NE, NW, SW, SE. Action: 0 HĐT/HMG thẳng + phải, 1 HĐT/HMG rẽ trái, 2 LVL thẳng + phải, 3 LVL rẽ trái (rẽ trái được bảo vệ). Giữ pha = xanh thêm 10 s; đổi pha = vàng 3 s, đỏ toàn phần ≥ 2 s tới khi vùng xung đột trống (tối đa 10 s), xanh tối thiểu 10 s.
+- Đèn theo từng hướng: mỗi nút vạch dừng có 3 loại `stop` (thẳng / trái / phải), xe chỉ tôn trọng loại của hướng mình. Bước mô phỏng 0,1 s.
+- State `4×6×20×16`: ô dọc 8 m từ vạch dừng × 16 sublane (sublane 0 sát bó vỉa phải); mặt nạ C5 theo số sublane và chiều dài thật của từng nhánh vào (NW chỉ 14 sublane). C4 lấy từ việc đổi sublane rời rạc của advanced_driving nên mỗi lần đổi làn cho ±1.
+- Lịch xe: `dqn_py/demand.py` site `lvl`, xe đến Poisson theo giả định bên dưới; xe chưa vào được nhánh nằm trong hàng đợi ngoài mạng (tính vào R1, R2, R4).
+
 ## Giả định chưa có số liệu
 
-- Đèn 2 pha cố định (xanh LVL 50 s, xanh HĐT 40 s, đỏ toàn phần 3 s), lưu lượng 2400 xe/h/nhánh, 85% xe máy, rẽ trái/phải 20%/20% — đều là tham số trong experiment.
-- Xe trên các connector cắt nhau trong vùng xung đột **không nhìn thấy nhau** (advanced_driving chỉ xử lý xe cùng road); đèn 2 pha tránh phần lớn xung đột, riêng rẽ trái với đi thẳng ngược chiều thì chưa.
+- Đèn 2 pha cố định của experiment `main` (xanh LVL 50 s, xanh HĐT 40 s, đỏ toàn phần 3 s), lưu lượng 2400 xe/h/nhánh, 85% xe máy, rẽ trái/phải 20%/20% — đều là tham số trong experiment; lịch xe train RL dùng cùng các số này.
+- Xe trên các connector cắt nhau trong vùng xung đột **không nhìn thấy nhau** (advanced_driving chỉ xử lý xe cùng road); đèn 4 pha của RL không cho hai hướng cắt nhau cùng xanh, đèn 2 pha thì rẽ trái vẫn cắt đi thẳng ngược chiều.
 - Không có quay đầu, không có người đi bộ.

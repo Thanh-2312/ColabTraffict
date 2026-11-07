@@ -36,6 +36,11 @@ BASE_DIR = os.path.dirname(os.path.abspath(__file__))
 DEFAULT_MODEL = os.path.join(
     os.path.dirname(BASE_DIR), "Traffic", "models", "intersection-dqn-python.gaml"
 )
+# doan: mang GAMA cu (Nguyen Trai - Khuat Duy Tien); lvl: nut Le Van Luong x Hoang Dao Thuy (chi state spatial)
+SITE_MODELS = {
+    "doan": DEFAULT_MODEL,
+    "lvl": os.path.join(os.path.dirname(BASE_DIR), "LeVanLuongIntersection", "models", "LeVanLuong.gaml"),
+}
 
 # Bieu thuc GAML: dong goi 18 bien thanh 1 chuoi "|" de 1 request lay het state
 STATE_PACK_EXPR = (

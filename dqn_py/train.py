@@ -20,7 +20,7 @@ from three_dqn_agent import ThreeDQNAgent, FlatDQNAgent
 from rainbow_agent import RainbowAgent
 from hybrid_agent import SpatialHybridAgent
 from tabular_agent import TabularQAgent
-from gama_env import GamaTrafficEnv, featurize
+from gama_env import GamaTrafficEnv, featurize, SITE_MODELS
 from server_manager import GamaServerManager
 from evaluate import evaluate_episode
 from demand import generate_demand, demand_parameters
@@ -95,13 +95,17 @@ def parse_args():
     p.add_argument("--c51-v-max", type=float, default=0.0)
     p.add_argument("--target-update", type=int, default=2000)
     p.add_argument("--model-path", type=str, default=None,
-                   help="Duong dan file .gaml (mac dinh intersection-dqn-python.gaml)")
+                   help="Duong dan file .gaml (mac dinh theo --site)")
+    p.add_argument("--site", choices=tuple(SITE_MODELS), default="doan",
+                   help="doan: mang GAMA cu; lvl: nut Le Van Luong (model + lich xe rieng)")
     args = p.parse_args()
     spatial_algorithm = args.algorithm in ("rainbow", "hybrid")
     if args.reward_mode is None:
         args.reward_mode = "r1" if spatial_algorithm else "reference"
     if spatial_algorithm != (args.reward_mode in ("r1", "r2", "r3", "r4")):
         p.error("Rainbow/hybrid require R1-R4; legacy agents require their original rewards")
+    if args.site == "lvl" and not spatial_algorithm:
+        p.error("The Le Van Luong model only provides the spatial state (rainbow/hybrid)")
     if args.buffer_size is None:
         args.buffer_size = 100_000 if spatial_algorithm else 1_000_000
     if args.warmup is None:
@@ -138,7 +142,7 @@ def training_config(args):
               "validation_seed_base", "lr", "gamma",
               "reward_mode", "r1_ref", "r2_ref", "b_ref", "r2_lambda", "r3_beta",
               "pressure_lambda", "demand_mode", "max_delay_sq", "buffer_size", "warmup", "batch_size",
-              "tau", "eps_start", "eps_decay_steps", "eps_min", "model_path")
+              "tau", "eps_start", "eps_decay_steps", "eps_min", "model_path", "site")
     config = {name: getattr(args, name) for name in fields}
     if args.algorithm == "rainbow":
         config.update({name: getattr(args, name) for name in
@@ -151,6 +155,9 @@ def training_config(args):
              "dqn_py/three_dqn_agent.py",
              "dqn_py/tabular_agent.py", "dqn_py/rainbow_agent.py", "dqn_py/train.py")
     files = files + ("dqn_py/hybrid_agent.py",)
+    if args.site == "lvl":
+        files = files + ("LeVanLuongIntersection/models/LeVanLuong.gaml",
+                         "LeVanLuongIntersection/includes/roads.geojson")
     config["code_sha256"] = {name: hashlib.sha256(
         (Path(BASE_DIR).parent / name).read_bytes()).hexdigest() for name in files}
     return config
@@ -251,7 +258,7 @@ async def amain(args):
         if args.demand_mode == "model":
             return None
         path = Path(outdir) / "demand" / f"seed_{seed}_h{args.episode_horizon}.csv"
-        generate_demand(path, seed, args.episode_horizon)
+        generate_demand(path, seed, args.episode_horizon, site=args.site)
         return demand_parameters(path)
 
     # 1. Server
@@ -270,7 +277,8 @@ async def amain(args):
         # 2. Environment + Agent
         for index in range(args.workers):
             env = GamaTrafficEnv(host=args.host, port=args.port + index,
-                                 model_path=args.model_path, reward_mode=args.reward_mode,
+                                 model_path=args.model_path or SITE_MODELS[args.site],
+                                 reward_mode=args.reward_mode,
                                  max_delay_sq=args.max_delay_sq,
                                  state_mode="spatial" if args.algorithm in ("rainbow", "hybrid") else "dtse",
                                  reset_mode="fresh" if args.workers > 1 else "reload",

@@ -17,6 +17,7 @@ Mô phỏng vi mô giao thông tại nút giao bốn nhánh bằng **GAMA Platfo
 | `Traffic/data/` | Dữ liệu đếm xe dùng để hiệu chỉnh |
 | `dqn_py/` | DQN, môi trường kết nối GAMA Server, huấn luyện và đánh giá |
 | `scripts/` | Benchmark, so sánh, kiểm thử và demo DQN |
+| `LeVanLuongIntersection/` | Nút Lê Văn Lương × Hoàng Đạo Thúy (hình học vệ tinh); train Rainbow/Hybrid bằng `train.py --site lvl`, xem [README](LeVanLuongIntersection/README.md) |
 
 Slide seminar, tài liệu nghiên cứu, checkpoint, kết quả chạy và ảnh chụp màn hình là dữ liệu cục bộ, không có trong repository. Các script tạo kết quả trong `comparison_results/` hoặc `dqn_py/run/`.
 

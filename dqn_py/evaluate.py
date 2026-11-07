@@ -31,7 +31,7 @@ from rainbow_agent import (RainbowAgent, ARCHITECTURE as RAINBOW_ARCHITECTURE,
                            LEGACY_ARCHITECTURE, PREVIOUS_ARCHITECTURE)
 from hybrid_agent import SpatialHybridAgent, ARCHITECTURE as HYBRID_ARCHITECTURE
 from tabular_agent import TabularQAgent, ARCHITECTURE as TABULAR_ARCHITECTURE
-from gama_env import GamaTrafficEnv, featurize
+from gama_env import GamaTrafficEnv, featurize, SITE_MODELS
 from server_manager import GamaServerManager
 from demand import generate_demand, demand_parameters
 
@@ -97,6 +97,8 @@ def parse_args():
     p.add_argument("--seed-base", type=int, default=20_000_000,
                    help="Seed danh gia (khac voi seed train de tranh overfit)")
     p.add_argument("--demand-mode", choices=("paired", "model"), default="paired")
+    p.add_argument("--site", choices=tuple(SITE_MODELS), default="doan",
+                   help="Phai trung voi --site luc train")
     p.add_argument("--port", type=int, default=6868)
     p.add_argument("--host", type=str, default="localhost")
     p.add_argument("--start-server", action="store_true")
@@ -128,6 +130,7 @@ async def amain(args):
         if is_spatial and "r1_ref" not in reward_options:
             reward_options["r1_ref"] = checkpoint.get("r1_ref", 50.0)
         env = GamaTrafficEnv(host=args.host, port=args.port,
+                             model_path=SITE_MODELS[args.site],
                              experiment=args.experiment,
                              reward_mode=checkpoint.get("reward_mode", "reference"),
                              state_mode="spatial" if is_spatial else "dtse",
@@ -177,7 +180,7 @@ async def amain(args):
                 if args.demand_mode == "paired":
                     demand_path = os.path.join(os.path.dirname(os.path.abspath(args.output)),
                                                "demand", f"seed_{seed}_h{args.episode_horizon}.csv")
-                    generate_demand(demand_path, seed, args.episode_horizon)
+                    generate_demand(demand_path, seed, args.episode_horizon, site=args.site)
                     parameters = demand_parameters(demand_path)
                 state, ep_reward, decisions, count = await evaluate_episode(
                     env, agent, seed, args.episode_horizon, writer, ep,
